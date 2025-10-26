@@ -19,6 +19,7 @@ type lruOption struct {
 
 	delPubSubChannel string
 	delPubSubCmd     redisPubSubCmdInterface
+	ctx              context.Context
 }
 
 type redisPubSubCmdInterface interface {
@@ -31,9 +32,9 @@ type LRU[K comparable, V any] struct {
 	c       *lru.Cache[K, V]
 }
 
-func WithLRUSize(size int) func(*lruOption) {
+func WithLRUContext(ctx context.Context) func(*lruOption) {
 	return func(o *lruOption) {
-		o.size = size
+		o.ctx = ctx
 	}
 }
 
@@ -47,10 +48,15 @@ func WithLRUDelPubSub(cmd redisPubSubCmdInterface, delPubSubChannel string) func
 func NewLRU[K comparable, V any](size int, opts ...func(*lruOption)) *LRU[K, V] {
 	options := &lruOption{
 		size: defaultLruSize,
+		ctx:  context.Background(),
 	}
 
 	for _, opt := range opts {
 		opt(options)
+	}
+
+	if size > 0 {
+		options.size = size
 	}
 
 	c, _ := lru.New[K, V](options.size)
@@ -75,8 +81,13 @@ func (l *LRU[K, V]) Set(key K, value V) {
 func (l *LRU[K, V]) Del(key K) {
 	l.c.Remove(key)
 	if l.options.delPubSubCmd != nil && l.options.delPubSubChannel != "" {
-		l.options.delPubSubCmd.Publish(context.Background(),
-			l.options.delPubSubChannel, fmt.Sprintf("%v", key))
+		err := l.options.delPubSubCmd.Publish(context.Background(),
+			l.options.delPubSubChannel,
+			fmt.Sprintf("%v", key),
+		).Err()
+		if err != nil {
+			slog.Error("failed to publish", "err", err, slog.Any("key", key))
+		}
 	}
 }
 

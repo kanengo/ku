@@ -101,31 +101,31 @@ func (l *LRU[K, V]) subscribeDel(ctx context.Context) {
 			case string:
 				k = any(msg.Payload).(K)
 			case int32:
-				t := convertx.StringToInteger[int32](msg.Payload)
+				t := convertx.String2Integer[int32](msg.Payload)
 				k = any(t).(K)
 			case int64:
-				t := convertx.StringToInteger[int64](msg.Payload)
+				t := convertx.String2Integer[int64](msg.Payload)
 				k = any(t).(K)
 			case uint32:
-				t := convertx.StringToInteger[uint32](msg.Payload)
+				t := convertx.String2Integer[uint32](msg.Payload)
 				k = any(t).(K)
 			case uint64:
-				t := convertx.StringToInteger[uint64](msg.Payload)
+				t := convertx.String2Integer[uint64](msg.Payload)
 				k = any(t).(K)
 			case uint16:
-				t := convertx.StringToInteger[uint16](msg.Payload)
+				t := convertx.String2Integer[uint16](msg.Payload)
 				k = any(t).(K)
 			case uint8:
-				t := convertx.StringToInteger[uint8](msg.Payload)
+				t := convertx.String2Integer[uint8](msg.Payload)
 				k = any(t).(K)
 			case int:
-				t := convertx.StringToInteger[int](msg.Payload)
+				t := convertx.String2Integer[int](msg.Payload)
 				k = any(t).(K)
 			case int16:
-				t := convertx.StringToInteger[int16](msg.Payload)
+				t := convertx.String2Integer[int16](msg.Payload)
 				k = any(t).(K)
 			case uint:
-				t := convertx.StringToInteger[uint](msg.Payload)
+				t := convertx.String2Integer[uint](msg.Payload)
 				k = any(t).(K)
 			default:
 				slog.Warn("unexpected key type", slog.String("key", msg.Payload), slog.String("type", fmt.Sprintf("%T", k)))

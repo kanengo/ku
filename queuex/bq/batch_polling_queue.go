@@ -4,13 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"slices"
 
 	"sync"
 	"time"
 
-	"github.com/bytedance/sonic"
 	"github.com/google/uuid"
 	"github.com/kanengo/ku/contextx"
 	"github.com/kanengo/ku/hashx/consistenthash.go"
@@ -95,15 +93,10 @@ type BatchPollingQueue[T queuex.Marshaler] struct {
 	wg  sync.WaitGroup
 	rdb redis.Cmdable
 
-	m consistenthash.Map
-
-	ctx    context.Context
-	cancel context.CancelFunc
+	m *consistenthash.Map
 }
 
 func NewBatchPollingQueue[T queuex.Marshaler](ctx context.Context, rdb redis.Cmdable, opts ...BatchPollingQueueOption) *BatchPollingQueue[T] {
-	var cancel context.CancelFunc
-	ctx, cancel = context.WithCancel(ctx)
 	options := defaultBatchPollingOptions
 
 	for _, opt := range opts {
@@ -111,10 +104,8 @@ func NewBatchPollingQueue[T queuex.Marshaler](ctx context.Context, rdb redis.Cmd
 	}
 
 	q := &BatchPollingQueue[T]{
-		opts:   options,
-		rdb:    rdb,
-		ctx:    ctx,
-		cancel: cancel,
+		opts: options,
+		rdb:  rdb,
 	}
 
 	if options.shardNum > 1 {
@@ -123,6 +114,7 @@ func NewBatchPollingQueue[T queuex.Marshaler](ctx context.Context, rdb redis.Cmd
 			key := q.queue(shard)
 			cm.Add(key)
 		}
+		q.m = cm
 	}
 
 	return q
@@ -147,18 +139,22 @@ func (bq *BatchPollingQueue[T]) taskKey(shardKey string, id string) string {
 
 func (bq *BatchPollingQueue[T]) enqueuWithShard(ctx context.Context, shard int, data ...T) error {
 	keys := make([]any, 0, len(data))
-	pl := bq.rdb.Pipeline()
+	fields := make([]any, 0, len(data)*2)
 	for _, v := range data {
 		content, err := v.Marshal()
 		if err != nil {
 			contextx.Logger(ctx).Warn("[BatchPollingQueue]Enqueue Marshal", "err", err, "data", v)
 			return err
 		}
-		taskKey := bq.taskKey(bq.queue(shard), bq.newTaskId())
-		pl.Set(ctx, taskKey, content, bq.opts.expiration)
-		keys = append(keys, taskKey)
+		taskId := bq.newTaskId()
+		taskKey := bq.taskKey(bq.queue(shard), taskId)
+		fields = append(fields, taskKey, content)
+		// pl.Set(ctx, taskKey, content, bq.opts.expiration)
+		keys = append(keys, taskId)
 	}
+	pl := bq.rdb.Pipeline()
 	pl.RPush(ctx, bq.queue(shard), keys...)
+	pl.MSet(ctx, fields...)
 	_, err := pl.Exec(ctx)
 	if err != nil {
 		return err
@@ -171,21 +167,17 @@ func (bq *BatchPollingQueue[T]) Enqueue(ctx context.Context, data ...T) error {
 		return bq.enqueuWithShard(ctx, 0, data...)
 	}
 
-	tasks := make([]task, 0, len(data))
+	shardTasks := make(map[string][]task)
 	for _, v := range data {
 		content, err := v.Marshal()
 		if err != nil {
 			contextx.Logger(ctx).Warn("[BatchPollingQueue]Enqueue Marshal", "err", err, "data", v)
 			return err
 		}
-		tasks = append(tasks, task{
+		t := task{
 			id:   bq.newTaskId(),
 			data: content,
-		})
-	}
-
-	shardTasks := make(map[string][]task)
-	for _, t := range tasks {
+		}
 		shardKey := bq.m.Get(t.id)
 		shardTasks[shardKey] = append(shardTasks[shardKey], t)
 	}
@@ -233,23 +225,21 @@ end
 return values
 `)
 
-func (bq *BatchPollingQueue[T]) poll(shard int, handler func(ctx context.Context, tasks []Task[T]) []string) {
+func (bq *BatchPollingQueue[T]) run(ctx context.Context, shard int, handler func(ctx context.Context, tasks []Task[T]) []string) {
 	intervalTicker := time.NewTicker(bq.opts.pollingInterval)
 	defer intervalTicker.Stop()
-	logger := contextx.Logger(bq.ctx)
+	logger := contextx.Logger(ctx)
 	shardKey := bq.queue(shard)
-	bq.wg.Add(1)
 	defer func() {
 		bq.wg.Done()
 	}()
-
 	for {
 		select {
-		case <-bq.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-intervalTicker.C:
 		}
-		values, err := batchPollingQueuePollScript.Run(bq.ctx, bq.rdb, []string{bq.retryQueue(shard),
+		values, err := batchPollingQueuePollScript.Run(ctx, bq.rdb, []string{bq.retryQueue(shard),
 			bq.queue(shard)}, bq.opts.batchSize).StringSlice()
 		if err != nil {
 			if !errors.Is(err, redis.Nil) {
@@ -261,12 +251,13 @@ func (bq *BatchPollingQueue[T]) poll(shard int, handler func(ctx context.Context
 			return bq.taskKey(shardKey, id)
 		})
 
-		taskContentList, err := bq.rdb.MGet(bq.ctx, taskKeys...).Result()
+		taskContentList, err := bq.rdb.MGet(ctx, taskKeys...).Result()
 		if err != nil {
 			logger.Warn("[BatchPollingQueue] mget failed", "err", err, "queue", bq.opts.queue, "shard", shard)
-			bq.rdb.RPush(bq.ctx, bq.retryQueue(shard), slicex.Map(values, func(item string, _ int) any {
+			bq.rdb.RPush(ctx, bq.retryQueue(shard), slicex.Map(values, func(item string, _ int) any {
 				return item
 			})...)
+			continue
 		}
 		data := make([]Task[T], 0, len(taskContentList))
 		for i, content := range taskContentList {
@@ -287,88 +278,50 @@ func (bq *BatchPollingQueue[T]) poll(shard int, handler func(ctx context.Context
 		if len(data) == 0 {
 			continue
 		}
-		retryList := handler(bq.ctx, data)
-		if len(retryList) > 0 {
-			bq.rdb.RPush(bq.ctx, bq.retryQueue(shard), slicex.Map(
-				retryList, func(v string, _ int) any {
-					return v
-				},
-			))
-		}
-		doneList := stringslicepool.Get(len(data) - len(retryList))[:0]
-		for _, id := range values {
-			if slices.Contains(retryList, id) {
-				continue
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("[BatchPollingQueue] poll panic", "err", r, "queue", bq.opts.queue, "shard", shard)
+				}
+			}()
+			retryList := handler(ctx, data)
+			if len(retryList) > 0 {
+				bq.rdb.RPush(ctx, bq.retryQueue(shard), slicex.Map(
+					retryList, func(v string, _ int) any {
+						return v
+					},
+				))
 			}
-			doneList = append(doneList, id)
-		}
-		if len(doneList) > 0 {
-			bq.rdb.Del(bq.ctx, doneList...)
-		}
-		stringslicepool.Put(doneList)
+			doneList := stringslicepool.Get(len(data) - len(retryList))[:0]
+			for _, id := range values {
+				if slices.Contains(retryList, id) {
+					continue
+				}
+				doneList = append(doneList, bq.taskKey(shardKey, id))
+			}
+			if len(doneList) > 0 {
+				bq.rdb.Del(ctx, doneList...)
+			}
+			stringslicepool.Put(doneList)
+		}()
 		//
 	}
 }
 
-func (bq *BatchPollingQueue[T]) Poll(handler func(ctx context.Context, data []T) error) {
-	intervalTicker := time.NewTicker(bq.opts.pollingInterval)
-	defer intervalTicker.Stop()
-	logger := contextx.Logger(bq.ctx)
-	for {
-		select {
-		case <-bq.ctx.Done():
-			return
-		case <-intervalTicker.C:
-		}
-		bq.wg.Add(1)
-		func() {
-			defer bq.wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					logger.Error("[panic]BatchPollingQueue", "r", r)
-				}
-			}()
-			// Iterate across all shards to poll batchSize items per shard.
-			shardNum := bq.opts.shardNum
-			if shardNum <= 0 {
-				shardNum = 1
-			}
-			for shard := 0; shard < shardNum; shard++ {
-				values, err := batchPollingQueuePollScript.Run(bq.ctx, bq.rdb, []string{bq.retryQueue(shard),
-					bq.queue(shard)}, bq.opts.batchSize).StringSlice()
-				if err != nil {
-					if !errors.Is(err, redis.Nil) {
-						logger.Warn("[BatchPollingQueue] poll", "err", err, "queue", bq.opts.queue, "shard", shard)
-					}
-					continue
-				}
-				data := make([]T, 0, len(values))
-				for _, value := range values {
-					var v T
-					err := sonic.UnmarshalString(value, &v)
-					if err != nil {
-						logger.Warn("[BatchPollingQueue] poll unmarshal", "err", err, "queue", bq.opts.queue, "shard", shard)
-						data = nil
-						break
-					}
-					data = append(data, v)
-				}
-				if len(data) == 0 {
-					continue
-				}
-				if err := handler(bq.ctx, data); err != nil {
-					logger.Warn("[BatchPollingQueue] retry", "err", err, slog.String("queue", bq.opts.queue), slog.Int("shard", shard))
-					bq.rdb.RPush(bq.ctx, bq.retryQueue(shard), slicex.Map(values, func(item string, _ int) any {
-						return item
-					})...)
-				}
-			}
-		}()
+func (bq *BatchPollingQueue[T]) poll(ctx context.Context, shard int, handler func(ctx context.Context, tasks []Task[T]) []string) {
+	for range bq.opts.concurrency {
+		go bq.run(ctx, shard, handler)
+	}
+}
+
+func (bq *BatchPollingQueue[T]) Poll(ctx context.Context, handler func(ctx context.Context, tasks []Task[T]) []string) {
+	bq.wg.Add(bq.opts.shardNum * bq.opts.concurrency)
+	for shard := range bq.opts.shardNum {
+		bq.poll(ctx, shard, handler)
 	}
 }
 
 func (bq *BatchPollingQueue[T]) Shutdown() error {
-	bq.cancel()
 	bq.wg.Wait()
 	return nil
 }

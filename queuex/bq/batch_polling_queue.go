@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync/atomic"
 
 	"sync"
 	"time"
@@ -93,7 +94,12 @@ type BatchPollingQueue[T queuex.Marshaler] struct {
 	wg  sync.WaitGroup
 	rdb redis.Cmdable
 
-	m *consistenthash.Map
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	cm *consistenthash.Map
+
+	polling atomic.Bool
 }
 
 func NewBatchPollingQueue[T queuex.Marshaler](ctx context.Context, rdb redis.Cmdable, opts ...BatchPollingQueueOption) *BatchPollingQueue[T] {
@@ -114,7 +120,7 @@ func NewBatchPollingQueue[T queuex.Marshaler](ctx context.Context, rdb redis.Cmd
 			key := q.queue(shard)
 			cm.Add(key)
 		}
-		q.m = cm
+		q.cm = cm
 	}
 
 	return q
@@ -178,7 +184,7 @@ func (bq *BatchPollingQueue[T]) Enqueue(ctx context.Context, data ...T) error {
 			id:   bq.newTaskId(),
 			data: content,
 		}
-		shardKey := bq.m.Get(t.id)
+		shardKey := bq.cm.Get(t.id)
 		shardTasks[shardKey] = append(shardTasks[shardKey], t)
 	}
 
@@ -278,8 +284,10 @@ func (bq *BatchPollingQueue[T]) run(ctx context.Context, shard int, handler func
 		if len(data) == 0 {
 			continue
 		}
+		bq.wg.Add(1)
 		func() {
 			defer func() {
+				bq.wg.Done()
 				if r := recover(); r != nil {
 					logger.Error("[BatchPollingQueue] poll panic", "err", r, "queue", bq.opts.queue, "shard", shard)
 				}
@@ -315,13 +323,21 @@ func (bq *BatchPollingQueue[T]) poll(ctx context.Context, shard int, handler fun
 }
 
 func (bq *BatchPollingQueue[T]) Poll(ctx context.Context, handler func(ctx context.Context, tasks []Task[T]) []string) {
+	if !bq.polling.CompareAndSwap(false, true) {
+		return
+	}
+	bq.ctx, bq.cancel = context.WithCancel(ctx)
 	bq.wg.Add(bq.opts.shardNum * bq.opts.concurrency)
 	for shard := range bq.opts.shardNum {
-		bq.poll(ctx, shard, handler)
+		bq.poll(bq.ctx, shard, handler)
 	}
 }
 
 func (bq *BatchPollingQueue[T]) Shutdown() error {
+	if !bq.polling.CompareAndSwap(true, false) {
+		return nil
+	}
+	bq.cancel()
 	bq.wg.Wait()
 	return nil
 }

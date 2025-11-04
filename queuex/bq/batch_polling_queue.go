@@ -284,10 +284,8 @@ func (bq *BatchPollingQueue[T]) run(ctx context.Context, shard int, handler func
 		if len(data) == 0 {
 			continue
 		}
-		bq.wg.Add(1)
 		func() {
 			defer func() {
-				bq.wg.Done()
 				if r := recover(); r != nil {
 					logger.Error("[BatchPollingQueue] poll panic", "err", r, "queue", bq.opts.queue, "shard", shard)
 				}
@@ -298,7 +296,7 @@ func (bq *BatchPollingQueue[T]) run(ctx context.Context, shard int, handler func
 					retryList, func(v string, _ int) any {
 						return v
 					},
-				))
+				)...)
 			}
 			doneList := stringslicepool.Get(len(data) - len(retryList))[:0]
 			for _, id := range values {
@@ -339,5 +337,6 @@ func (bq *BatchPollingQueue[T]) Shutdown() error {
 	}
 	bq.cancel()
 	bq.wg.Wait()
+
 	return nil
 }

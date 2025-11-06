@@ -17,10 +17,10 @@ func NewJsonMarshaler[T any](data T) JsonMarshaler[T] {
 	}
 }
 
-func (j *JsonMarshaler[T]) Marshal() (string, error) {
+func (j JsonMarshaler[T]) Marshal() (string, error) {
 	return sonic.MarshalString(j.Data)
 }
 
-func (j *JsonMarshaler[T]) Unmarshal(data string) error {
+func (j JsonMarshaler[T]) Unmarshal(data string) error {
 	return sonic.UnmarshalString(data, &j.Data)
 }

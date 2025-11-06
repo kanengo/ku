@@ -283,6 +283,10 @@ func (bq *BatchDelayQueue[T]) run(ctx context.Context, shard int, handler func(c
 			}
 			continue
 		}
+
+		if len(values) == 0 {
+			continue
+		}
 		taskKeys := slicex.Map(values, func(id string, _ int) string {
 			return bq.taskKey(shardKey, id)
 		})

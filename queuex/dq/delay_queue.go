@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"sync/atomic"
 
 	"sync"
@@ -20,13 +19,14 @@ import (
 )
 
 type BatchDelayQOptions struct {
-	queue           string
-	batchSize       int64
-	pollingInterval time.Duration
-	shardNum        int
-	expiration      time.Duration
-	concurrency     int
-	queueDepth      int
+	queue             string
+	batchSize         int64
+	pollingInterval   time.Duration
+	shardNum          int
+	expiration        time.Duration
+	concurrency       int
+	queueDepth        int
+	redeliverInterval time.Duration
 }
 
 type BatchDelayQueueOption func(*BatchDelayQOptions)
@@ -76,13 +76,14 @@ func WithQueueDepth(depth int) BatchDelayQueueOption {
 }
 
 var defaultBatchDelayOptions = BatchDelayQOptions{
-	queue:           "default",
-	batchSize:       100,
-	pollingInterval: time.Second * 1,
-	shardNum:        1,
-	expiration:      time.Hour * 24,
-	concurrency:     1,
-	queueDepth:      100,
+	queue:             "default",
+	batchSize:         100,
+	pollingInterval:   time.Second * 1,
+	shardNum:          1,
+	expiration:        time.Hour * 24,
+	concurrency:       1,
+	queueDepth:        100,
+	redeliverInterval: 3 * time.Second,
 }
 
 type DelayTask struct {
@@ -160,6 +161,10 @@ func (bq *BatchDelayQueue) queue(shard int) string {
 
 func (bq *BatchDelayQueue) retryQueue(shard int) string {
 	return fmt.Sprintf("bdq:{%s:%d}:retry", bq.opts.queue, shard)
+}
+
+func (bq *BatchDelayQueue) pendingQueue(shard int) string {
+	return fmt.Sprintf("bdq:{%s:%d}:pending", bq.opts.queue, shard)
 }
 
 func (bq *BatchDelayQueue) taskKey(shardKey string, id string) string {
@@ -256,6 +261,9 @@ if values then
 	retryNum = #values
 end
 if retryNum >= batchSize then
+	for _, v in ipairs(values) do
+		redis.call("ZADD", KEYS[3], ARGV[3], v)
+	end
 	return values
 end
 local left = batchSize - retryNum
@@ -264,11 +272,21 @@ if #values2 > 0 then
 	redis.call("ZREMRANGEBYRANK",KEYS[2], 0, #values2 - 1)
 end
 if not values then
+	if values2 then
+		for _, v in ipairs(values2) do
+			redis.call("ZADD", KEYS[3], ARGV[3], v)
+		end
+	end
 	return values2
 end
 if #values2 > 0 then
 	for _, v in ipairs(values2) do
 		table.insert(values, v)
+	end
+end
+if values then
+	for _, v in ipairs(values) do
+		redis.call("ZADD", KEYS[3], ARGV[3], v)
 	end
 end
 return values
@@ -289,9 +307,13 @@ func (bq *BatchDelayQueue) run(ctx context.Context, shard int) {
 		if ctx.Err() != nil {
 			break
 		}
-
-		values, err := batchDelayQueuePollScript.Run(ctx, bq.rdb, []string{bq.retryQueue(shard),
-			bq.queue(shard)}, bq.opts.batchSize, time.Now().Unix()).StringSlice()
+		now := time.Now()
+		values, err := batchDelayQueuePollScript.Run(ctx, bq.rdb, []string{
+			bq.retryQueue(shard),
+			bq.queue(shard),
+			bq.pendingQueue(shard),
+		}, bq.opts.batchSize, now.Unix(),
+			now.Add(bq.opts.redeliverInterval).Unix()).StringSlice()
 		if err != nil {
 			if !errors.Is(err, redis.Nil) {
 				logger.Warn("[BatchDelayQueue] poll", "err", err, "queue", bq.opts.queue, "shard", shard)
@@ -365,26 +387,65 @@ func (bq *BatchDelayQueue) processTasks(msg wrappedTasks, handler func(ctx conte
 			logger.Error("[BatchDelayQueue] poll panic", "err", r, "queue", bq.opts.queue, "shard", msg.shard)
 		}
 	}()
-	retryList := handler(msg.ctx, msg.ts)
-	if len(retryList) > 0 {
-		bq.rdb.RPush(msg.ctx, bq.retryQueue(msg.shard), slicex.Map(
-			retryList, func(v string, _ int) any {
-				return v
-			},
-		)...)
+	ackList := handler(msg.ctx, msg.ts)
+	if len(ackList) == 0 {
+		return
 	}
 	shardKey := bq.queue(msg.shard)
-	doneList := stringslicepool.Get(len(msg.ts) - len(retryList))[:0]
-	for _, t := range msg.ts {
-		if slices.Contains(retryList, t.Id) {
-			continue
-		}
-		doneList = append(doneList, bq.taskKey(shardKey, t.Id))
-	}
-	if len(doneList) > 0 {
-		bq.rdb.Del(msg.ctx, doneList...)
-	}
+	doneList := stringslicepool.Get(len(ackList))[:0]
 	stringslicepool.Put(doneList)
+	defer stringslicepool.Put(doneList)
+	for _, id := range ackList {
+		doneList = append(doneList, bq.taskKey(shardKey, id))
+	}
+
+	pl := bq.rdb.Pipeline()
+	pl.Del(msg.ctx, doneList...)
+	pl.ZRem(msg.ctx, bq.pendingQueue(msg.shard),
+		slicex.Map(ackList, func(id string, _ int) any {
+			return id
+		})...,
+	)
+	pl.Exec(msg.ctx)
+}
+
+func (bq *BatchDelayQueue) reclaimPendingMessagesLoop(ctx context.Context, shard int) {
+	bq.reclaimPendingMessages(ctx, shard)
+	ticker := time.NewTicker(bq.opts.redeliverInterval)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			bq.reclaimPendingMessages(ctx, shard)
+		}
+	}
+}
+
+var reclaimPendingMessagesScript = redis.NewScript(`
+local batchSize = tonumber(ARGV[1])
+local values = redis.call("ZRANGE", KEYS[1], "-inf", ARGV[2], "BYSCORE", "LIMIT", 0, batchSize - 1)
+if #values > 0 then
+	redis.call("ZREMRANGEBYRANK",KEYS[1], 0, #values - 1)
+	redis.call("LPUSH", KEYS[2], unpack(values))
+end
+return 0
+`)
+
+func (bq *BatchDelayQueue) reclaimPendingMessages(ctx context.Context, shard int) {
+	err := reclaimPendingMessagesScript.Run(ctx, bq.rdb, []string{
+		bq.pendingQueue(shard),
+		bq.retryQueue(shard),
+	},
+		bq.opts.queueDepth,
+		time.Now().Unix(),
+	).Err()
+	if err != nil {
+		if !errors.Is(err, redis.Nil) {
+			contextx.Logger(ctx).Error("reclaimPendingMessages", "err", err, "shard", shard)
+		}
+		return
+	}
 }
 
 func (bq *BatchDelayQueue) Poll(ctx context.Context, handler func(ctx context.Context, tasks []Task) []string) {
@@ -412,6 +473,14 @@ func (bq *BatchDelayQueue) Poll(ctx context.Context, handler func(ctx context.Co
 	for shard := range bq.opts.shardNum {
 		bq.wg.Add(1)
 		bq.poll(loopCtx, shard)
+	}
+
+	for shard := range bq.opts.shardNum {
+		bq.wg.Add(1)
+		go func() {
+			defer bq.wg.Done()
+			bq.reclaimPendingMessagesLoop(loopCtx, shard)
+		}()
 	}
 }
 

@@ -40,18 +40,18 @@ func TestBpq(t *testing.T) {
 
 	bdq.Poll(context.Background(), func(ctx context.Context, tasks []Task) []string {
 		fmt.Println(tasks)
-		var retryList []string
+		var ackList []string
 		for _, t := range tasks {
 			w := rand.IntN(10000)
-			if w > 7000 {
-				retryList = append(retryList, t.Id)
+			if w <= 9000 {
+				ackList = append(ackList, t.Id)
 			}
 		}
 
-		return retryList
+		return ackList
 	})
 
-	time.Sleep(time.Second * 5)
+	time.Sleep(time.Second * 25)
 
 	bdq.Shutdown()
 

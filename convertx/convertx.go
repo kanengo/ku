@@ -86,7 +86,7 @@ func ToString(v any) string {
 	}
 }
 
-func JsonStringToStruct[T any](content string) basex.Result[T] {
+func JsonString2Struct[T any](content string) basex.Result[T] {
 	var data T
 	err := sonic.UnmarshalString(content, &data)
 	if err != nil {
@@ -96,7 +96,7 @@ func JsonStringToStruct[T any](content string) basex.Result[T] {
 	return basex.ResultOk(data)
 }
 
-func JsonToStruct[T any](content []byte) basex.Result[T] {
+func Json2Struct[T any](content []byte) basex.Result[T] {
 	var data T
 	err := sonic.UnmarshalString(unsafex.Bytes2String(content), &data)
 	if err != nil {
@@ -106,10 +106,10 @@ func JsonToStruct[T any](content []byte) basex.Result[T] {
 	return basex.ResultOk(data)
 }
 
-func StructToJson[T any](data T) basex.Result[[]byte] {
+func Struct2Json[T any](data T) basex.Result[[]byte] {
 	return basex.ResultTuple(sonic.Marshal(data))
 }
 
-func StructToJsonString[T any](data T) basex.Result[string] {
+func Struct2JsonString[T any](data T) basex.Result[string] {
 	return basex.ResultTuple(sonic.MarshalString(data))
 }

@@ -1,4 +1,4 @@
-package dq
+package bq
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-func TestBdq(t *testing.T) {
+func TestBpq(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379",
 		Password: "redis-test-0",
@@ -27,18 +27,15 @@ func TestBdq(t *testing.T) {
 		Name string
 	}
 
-	bdq, _ := NewBatchDelayQueue(context.Background(), "test", rdb, WithConcurrency(4), WithShardNum(4))
+	bdq, _ := NewBatchPollingQueue(context.Background(), "test", rdb, WithConcurrency(4), WithShardNum(4))
 
 	for i := range 100 {
 		s := S{
 			Id:   100 + int64(i),
 			Name: "leeka",
 		}
-		convertx.Struct2JsonString(s).Must()
-		bdq.Enqueue(context.Background(), DelayTask{
-			ProcessAt: time.Now().Add(time.Second).Unix(),
-			Data:      convertx.Struct2JsonString(s).Must(),
-		})
+		bdq.Enqueue(context.Background(), convertx.Struct2JsonString(s).Must())
+
 	}
 
 	bdq.Poll(context.Background(), func(ctx context.Context, tasks []Task) []string {

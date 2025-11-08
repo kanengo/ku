@@ -10,11 +10,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bytedance/gopkg/util/logger"
 	"github.com/google/uuid"
 	"github.com/kanengo/ku/contextx"
 	"github.com/kanengo/ku/hashx/consistenthash.go"
 	"github.com/kanengo/ku/poolx/stringslicepool"
-	"github.com/kanengo/ku/queuex"
 	"github.com/kanengo/ku/slicex"
 	"github.com/redis/go-redis/v9"
 )
@@ -26,6 +26,7 @@ type BatchDelayQOptions struct {
 	shardNum        int
 	expiration      time.Duration
 	concurrency     int
+	queueDepth      int
 }
 
 type BatchDelayQueueOption func(*BatchDelayQOptions)
@@ -68,6 +69,12 @@ func WithConcurrency(num int) BatchDelayQueueOption {
 	}
 }
 
+func WithQueueDepth(depth int) BatchDelayQueueOption {
+	return func(o *BatchDelayQOptions) {
+		o.queueDepth = depth
+	}
+}
+
 var defaultBatchDelayOptions = BatchDelayQOptions{
 	queue:           "default",
 	batchSize:       100,
@@ -75,31 +82,47 @@ var defaultBatchDelayOptions = BatchDelayQOptions{
 	shardNum:        1,
 	expiration:      time.Hour * 24,
 	concurrency:     1,
+	queueDepth:      100,
 }
 
-type DelayTask[T queuex.Marshaler] struct {
-	Key       string
+type DelayTask struct {
+	Id        string
 	ProcessAt int64
-	Data      T
+	Data      string
 }
 
-type BatchDelayQueue[T queuex.Marshaler] struct {
+type Task struct {
+	Id   string
+	Data string
+}
+
+type wrappedTasks struct {
+	ctx   context.Context
+	shard int
+	ts    []Task
+}
+
+type BatchDelayQueue struct {
 	opts BatchDelayQOptions
 
 	wg  sync.WaitGroup
 	rdb redis.Cmdable
 
-	ctx    context.Context
-	cancel context.CancelFunc
-
 	polling atomic.Bool
 
 	cm *consistenthash.Map
+
+	queueCh chan wrappedTasks
+
+	closeCh chan struct{}
 }
 
-func NewBatchDelayQueue[T queuex.Marshaler](ctx context.Context, queue string, rdb redis.Cmdable, opts ...BatchDelayQueueOption) *BatchDelayQueue[T] {
-	var cancel context.CancelFunc
-	ctx, cancel = context.WithCancel(ctx)
+func NewBatchDelayQueue(ctx context.Context, queue string, rdb redis.Cmdable, opts ...BatchDelayQueueOption) (*BatchDelayQueue, error) {
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		return nil, err
+	}
+
 	options := defaultBatchDelayOptions
 	options.queue = queue
 
@@ -107,11 +130,11 @@ func NewBatchDelayQueue[T queuex.Marshaler](ctx context.Context, queue string, r
 		opt(&options)
 	}
 
-	q := &BatchDelayQueue[T]{
-		opts:   options,
-		rdb:    rdb,
-		ctx:    ctx,
-		cancel: cancel,
+	q := &BatchDelayQueue{
+		opts:    options,
+		rdb:     rdb,
+		queueCh: make(chan wrappedTasks, options.queueDepth),
+		closeCh: make(chan struct{}),
 	}
 
 	if options.shardNum > 1 {
@@ -123,41 +146,36 @@ func NewBatchDelayQueue[T queuex.Marshaler](ctx context.Context, queue string, r
 		q.cm = cm
 	}
 
-	return q
+	return q, nil
 }
 
-func (bq *BatchDelayQueue[T]) newTaskId() string {
+func (bq *BatchDelayQueue) newTaskId() string {
 	u7, _ := uuid.NewV7()
 	return u7.String()
 }
 
-func (bq *BatchDelayQueue[T]) queue(shard int) string {
+func (bq *BatchDelayQueue) queue(shard int) string {
 	return fmt.Sprintf("bdq:{%s:%d}", bq.opts.queue, shard)
 }
 
-func (bq *BatchDelayQueue[T]) retryQueue(shard int) string {
+func (bq *BatchDelayQueue) retryQueue(shard int) string {
 	return fmt.Sprintf("bdq:{%s:%d}:retry", bq.opts.queue, shard)
 }
 
-func (bq *BatchDelayQueue[T]) taskKey(shardKey string, id string) string {
+func (bq *BatchDelayQueue) taskKey(shardKey string, id string) string {
 	return fmt.Sprintf("%s:%s", shardKey, id)
 }
 
-func (bq *BatchDelayQueue[T]) enqueueByOneShard(ctx context.Context, tasks ...DelayTask[T]) error {
+func (bq *BatchDelayQueue) enqueueByOneShard(ctx context.Context, tasks ...DelayTask) error {
 	fields := make([]any, 0, len(tasks)*2)
 	zs := make([]redis.Z, 0, len(tasks))
 	for _, v := range tasks {
-		content, err := v.Data.Marshal()
-		if err != nil {
-			contextx.Logger(ctx).Warn("[BatchDelayQueue]Enqueue Marshal", "err", err, "data", v)
-			return err
-		}
-		taskKey := bq.taskKey(bq.queue(0), v.Key)
-		fields = append(fields, taskKey, content)
+		taskKey := bq.taskKey(bq.queue(0), v.Id)
+		fields = append(fields, taskKey, v.Data)
 		// pl.Set(ctx, taskKey, content, bq.opts.expiration)
 		zs = append(zs, redis.Z{
 			Score:  float64(v.ProcessAt),
-			Member: v.Key,
+			Member: v.Id,
 		})
 	}
 	pl := bq.rdb.Pipeline()
@@ -171,39 +189,34 @@ func (bq *BatchDelayQueue[T]) enqueueByOneShard(ctx context.Context, tasks ...De
 	return nil
 }
 
-func (bq *BatchDelayQueue[T]) Enqueue(ctx context.Context, tasks ...DelayTask[T]) error {
+func (bq *BatchDelayQueue) Enqueue(ctx context.Context, tasks ...DelayTask) error {
 	for i := range tasks {
-		if tasks[i].Key == "" {
-			tasks[i].Key = bq.newTaskId()
+		if tasks[i].Id == "" {
+			tasks[i].Id = bq.newTaskId()
 		}
 	}
 	if bq.opts.shardNum <= 1 {
 		return bq.enqueueByOneShard(ctx, tasks...)
 	}
 
-	shardTasks := make(map[string][]DelayTask[T])
+	shardTasks := make(map[string][]DelayTask)
 	for _, v := range tasks {
-		shardKey := bq.cm.Get(v.Key)
+		shardKey := bq.cm.Get(v.Id)
 		shardTasks[shardKey] = append(shardTasks[shardKey], v)
 	}
 
 	pl := bq.rdb.Pipeline()
 	for shardKey, ts := range shardTasks {
 		fields := make([]any, 0, len(ts)*2)
-		zs := slicex.Map(ts, func(t DelayTask[T], _ int) redis.Z {
+		zs := slicex.Map(ts, func(t DelayTask, _ int) redis.Z {
 			return redis.Z{
 				Score:  float64(t.ProcessAt),
-				Member: t.Key,
+				Member: t.Id,
 			}
 		})
 		for _, v := range ts {
-			content, err := v.Data.Marshal()
-			if err != nil {
-				contextx.Logger(ctx).Warn("[BatchDelayQueue]Enqueue Marshal", "err", err, "data", v)
-				return err
-			}
-			taskKey := bq.taskKey(shardKey, v.Key)
-			fields = append(fields, taskKey, content)
+			taskKey := bq.taskKey(shardKey, v.Id)
+			fields = append(fields, taskKey, v.Data)
 		}
 		pl.ZAdd(ctx, shardKey, zs...)
 		pl.MSet(ctx, fields...)
@@ -222,7 +235,7 @@ redis.call("DEL", KEYS[2])
 return 0
 `)
 
-func (bq *BatchDelayQueue[T]) RemoveTask(ctx context.Context, key string) error {
+func (bq *BatchDelayQueue) RemoveTask(ctx context.Context, key string) error {
 	var shardKey string
 	if bq.opts.shardNum <= 1 {
 		shardKey = bq.queue(0)
@@ -261,20 +274,22 @@ end
 return values
 `)
 
-func (bq *BatchDelayQueue[T]) run(ctx context.Context, shard int, handler func(ctx context.Context, tasks []DelayTask[T]) []string) {
+func (bq *BatchDelayQueue) run(ctx context.Context, shard int) {
 	intervalTicker := time.NewTicker(bq.opts.pollingInterval)
 	defer intervalTicker.Stop()
 	logger := contextx.Logger(ctx)
 	shardKey := bq.queue(shard)
-	defer func() {
-		bq.wg.Done()
-	}()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-intervalTicker.C:
 		}
+
+		if ctx.Err() != nil {
+			break
+		}
+
 		values, err := batchDelayQueuePollScript.Run(ctx, bq.rdb, []string{bq.retryQueue(shard),
 			bq.queue(shard)}, bq.opts.batchSize, time.Now().Unix()).StringSlice()
 		if err != nil {
@@ -299,77 +314,113 @@ func (bq *BatchDelayQueue[T]) run(ctx context.Context, shard int, handler func(c
 			})...)
 			continue
 		}
-		data := make([]DelayTask[T], 0, len(taskContentList))
+		ts := make([]Task, 0, len(taskContentList))
 		for i, content := range taskContentList {
 			if content == nil {
 				continue
 			}
-			var v T
-			err := v.Unmarshal(content.(string))
-			if err != nil {
-				logger.Warn("[BatchDelayQueue] poll unmarshal", "err", err, "queue", bq.opts.queue, "shard", shard)
-				continue
-			}
-			data = append(data, DelayTask[T]{
-				Key:  values[i],
-				Data: v,
+
+			ts = append(ts, Task{
+				Id:   values[i],
+				Data: content.(string),
 			})
 		}
-		if len(data) == 0 {
+		if len(ts) == 0 {
 			continue
 		}
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					logger.Error("[BatchDelayQueue] poll panic", "err", r, "queue", bq.opts.queue, "shard", shard)
-				}
-			}()
-			retryList := handler(ctx, data)
-			if len(retryList) > 0 {
-				bq.rdb.RPush(ctx, bq.retryQueue(shard), slicex.Map(
-					retryList, func(v string, _ int) any {
-						return v
-					},
-				)...)
-			}
-			doneList := stringslicepool.Get(len(data) - len(retryList))[:0]
-			for _, id := range values {
-				if slices.Contains(retryList, id) {
-					continue
-				}
-				doneList = append(doneList, bq.taskKey(shardKey, id))
-			}
-			if len(doneList) > 0 {
-				bq.rdb.Del(ctx, doneList...)
-			}
-			stringslicepool.Put(doneList)
-		}()
+		select {
+		case bq.queueCh <- wrappedTasks{
+			ctx:   ctx,
+			ts:    ts,
+			shard: shard,
+		}:
+		case <-ctx.Done():
+			return
+		}
 		//
 	}
 }
 
-func (bq *BatchDelayQueue[T]) poll(ctx context.Context, shard int, handler func(ctx context.Context, tasks []DelayTask[T]) []string) {
-	for range bq.opts.concurrency {
-		go bq.run(ctx, shard, handler)
+func (bq *BatchDelayQueue) poll(ctx context.Context, shard int) {
+	go func() {
+		defer bq.wg.Done()
+		bq.run(ctx, shard)
+	}()
+}
+
+func (bq *BatchDelayQueue) worker(handler func(ctx context.Context, tasks []Task) []string) {
+	for {
+		select {
+		case <-bq.closeCh:
+			return
+		case msg := <-bq.queueCh:
+			bq.processTasks(msg, handler)
+		}
 	}
 }
 
-func (bq *BatchDelayQueue[T]) Poll(ctx context.Context, handler func(ctx context.Context, tasks []DelayTask[T]) []string) {
+func (bq *BatchDelayQueue) processTasks(msg wrappedTasks, handler func(ctx context.Context, tasks []Task) []string) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("[BatchDelayQueue] poll panic", "err", r, "queue", bq.opts.queue, "shard", msg.shard)
+		}
+	}()
+	retryList := handler(msg.ctx, msg.ts)
+	if len(retryList) > 0 {
+		bq.rdb.RPush(msg.ctx, bq.retryQueue(msg.shard), slicex.Map(
+			retryList, func(v string, _ int) any {
+				return v
+			},
+		)...)
+	}
+	shardKey := bq.queue(msg.shard)
+	doneList := stringslicepool.Get(len(msg.ts) - len(retryList))[:0]
+	for _, t := range msg.ts {
+		if slices.Contains(retryList, t.Id) {
+			continue
+		}
+		doneList = append(doneList, bq.taskKey(shardKey, t.Id))
+	}
+	if len(doneList) > 0 {
+		bq.rdb.Del(msg.ctx, doneList...)
+	}
+	stringslicepool.Put(doneList)
+}
+
+func (bq *BatchDelayQueue) Poll(ctx context.Context, handler func(ctx context.Context, tasks []Task) []string) {
 	if !bq.polling.CompareAndSwap(false, true) {
 		return
 	}
-	bq.ctx, bq.cancel = context.WithCancel(ctx)
-	bq.wg.Add(bq.opts.shardNum * bq.opts.concurrency)
+	loopCtx, cancel := context.WithCancel(ctx)
+	bq.wg.Add(1)
+	go func() {
+		defer bq.wg.Done()
+		defer cancel()
+		select {
+		case <-loopCtx.Done():
+		case <-bq.closeCh:
+		}
+	}()
+	for range bq.opts.concurrency {
+		bq.wg.Add(1)
+		go func() {
+			defer bq.wg.Done()
+			bq.worker(handler)
+		}()
+	}
+
 	for shard := range bq.opts.shardNum {
-		bq.poll(bq.ctx, shard, handler)
+		bq.wg.Add(1)
+		bq.poll(loopCtx, shard)
 	}
 }
 
-func (bq *BatchDelayQueue[T]) Shutdown() error {
+func (bq *BatchDelayQueue) Shutdown() error {
 	if !bq.polling.CompareAndSwap(true, false) {
 		return nil
 	}
-	bq.cancel()
+
+	close(bq.closeCh)
 	bq.wg.Wait()
 
 	return nil

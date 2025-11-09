@@ -10,11 +10,21 @@ import (
 )
 
 type Integer interface {
-	int32 | int64 | uint64 | uint32 | uint16 | uint8 | uint | int | int16
+	int32 | int64 | int | int16 | byte
+}
+
+type UInteger interface {
+	uint32 | uint64 | uint16 | uint8 | uint
 }
 
 func String2Integer[T Integer](s string) T {
 	i, _ := strconv.ParseInt(s, 10, 64)
+
+	return T(i)
+}
+
+func String2UInteger[T UInteger](s string) T {
+	i, _ := strconv.ParseUint(s, 10, 64)
 
 	return T(i)
 }
@@ -25,6 +35,10 @@ func Convert[S, D any](s S, fn func(s S) D) D {
 
 func Integer2String[T Integer](i T) string {
 	return strconv.FormatInt(int64(i), 10)
+}
+
+func UInteger2String[T UInteger](i T) string {
+	return strconv.FormatUint(uint64(i), 10)
 }
 
 func ToInt64(v any) int64 {
@@ -60,15 +74,15 @@ func ToString(v any) string {
 	case int32:
 		return Integer2String(v)
 	case uint64:
-		return Integer2String(v)
+		return UInteger2String(v)
 	case uint32:
-		return Integer2String(v)
+		return UInteger2String(v)
 	case uint16:
-		return Integer2String(v)
+		return UInteger2String(v)
 	case uint8:
-		return Integer2String(v)
+		return UInteger2String(v)
 	case uint:
-		return Integer2String(v)
+		return UInteger2String(v)
 	case int16:
 		return Integer2String(v)
 	case float64:

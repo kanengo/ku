@@ -1,4 +1,4 @@
-package cachex
+package redisx
 
 import (
 	"context"

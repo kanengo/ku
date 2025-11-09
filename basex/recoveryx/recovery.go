@@ -1,4 +1,4 @@
-package basex
+package recoveryx
 
 import (
 	"runtime"
@@ -6,7 +6,7 @@ import (
 	"github.com/bytedance/gopkg/util/logger"
 )
 
-type panicHandler func(r interface{})
+type panicHandler func(r any)
 
 var buildPanicHandlers []panicHandler
 

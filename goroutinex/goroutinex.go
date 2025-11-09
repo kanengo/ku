@@ -1,10 +1,12 @@
 package goroutinex
 
-import "github.com/kanengo/ku/basex"
+import (
+	"github.com/kanengo/ku/basex/recoveryx"
+)
 
 func GoSafe(f func()) {
 	go func() {
-		defer basex.Recover()
+		defer recoveryx.Recover()
 		f()
 	}()
 }

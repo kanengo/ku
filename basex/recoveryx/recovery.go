@@ -35,6 +35,9 @@ func Revocery(handlers ...PanicHandler) func() {
 			for _, h := range handlers {
 				h(r)
 			}
+			for _, h := range buildPanicHandlers {
+				h(r)
+			}
 		}
 	}
 }

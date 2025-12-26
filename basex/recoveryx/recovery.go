@@ -1,9 +1,8 @@
 package recoveryx
 
 import (
+	"log/slog"
 	"runtime"
-
-	"github.com/bytedance/gopkg/util/logger"
 )
 
 type panicHandler func(r any)
@@ -17,10 +16,25 @@ func RegisterPanicHandler(handler panicHandler) {
 func Recover() {
 	if r := recover(); r != nil {
 		stack := make([]byte, 1024)
-		runtime.Stack(stack, false)
-		logger.Error("panic recover", "err", r, "stack", string(stack))
+		n := runtime.Stack(stack, false)
+		stack = stack[:n]
+		slog.Error("panic recover", "err", r, "stack", string(stack))
 		for _, h := range buildPanicHandlers {
 			h(r)
+		}
+	}
+}
+
+func Revocery(handlers ...panicHandler) func() {
+	return func() {
+		if r := recover(); r != nil {
+			stack := make([]byte, 1024)
+			n := runtime.Stack(stack, false)
+			stack = stack[:n]
+			slog.Error("panic recover", "err", r, "stack", string(stack))
+			for _, h := range handlers {
+				h(r)
+			}
 		}
 	}
 }

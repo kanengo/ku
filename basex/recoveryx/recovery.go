@@ -5,11 +5,11 @@ import (
 	"runtime"
 )
 
-type panicHandler func(r any)
+type PanicHandler func(r any)
 
-var buildPanicHandlers []panicHandler
+var buildPanicHandlers []PanicHandler
 
-func RegisterPanicHandler(handler panicHandler) {
+func RegisterPanicHandler(handler PanicHandler) {
 	buildPanicHandlers = append(buildPanicHandlers, handler)
 }
 
@@ -25,7 +25,7 @@ func Recover() {
 	}
 }
 
-func Revocery(handlers ...panicHandler) func() {
+func Revocery(handlers ...PanicHandler) func() {
 	return func() {
 		if r := recover(); r != nil {
 			stack := make([]byte, 1024)

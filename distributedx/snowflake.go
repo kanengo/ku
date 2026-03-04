@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -15,21 +16,25 @@ import (
 const (
 	defaultTableName        = "snowflake_workers"
 	defaultHeartbeat        = 3 * time.Second
-	defaultWorkerTimeout    = 6 * time.Second
+	defaultWorkerTimeout    = 15 * time.Second
 	maxWorkerID             = snowflakex.MaxWorkerID
 	workerAllocationRetries = 3
+	// safetyThreshold is the max time without heartbeat before we consider our lease lost.
+	// It must be less than defaultWorkerTimeout.
+	safetyThreshold = 10 * time.Second
 )
 
 // Snowflake represents a distributed snowflake ID generator backed by PostgreSQL
 type Snowflake struct {
 	*snowflakex.Node
-	conn      *pgx.Conn
-	workerID  int64
-	epoch     int64
-	tableName string
-	ctx       context.Context
-	cancel    context.CancelFunc
-	done      chan struct{}
+	conn          *pgx.Conn
+	workerID      int64
+	epoch         int64
+	lastHeartbeat atomic.Int64
+	tableName     string
+	ctx           context.Context
+	cancel        context.CancelFunc
+	done          chan struct{}
 }
 
 // Config configuration for distributed snowflake
@@ -98,10 +103,24 @@ func New(ctx context.Context, config Config) (*Snowflake, error) {
 		cancel:    cancel,
 		done:      make(chan struct{}),
 	}
+	sf.lastHeartbeat.Store(time.Now().UnixNano())
 
 	go sf.heartbeat()
 
 	return sf, nil
+}
+
+// Generate creates and returns a unique snowflake ID
+// It panics if the worker lease has expired to prevent ID collision.
+func (s *Snowflake) Generate() int64 {
+	last := s.lastHeartbeat.Load()
+	if time.Since(time.Unix(0, last)) > safetyThreshold {
+		// Panic is the safest option here. Returning an error would require changing the signature
+		// and breaking standard snowflake interface. Returning a zero/negative ID is risky.
+		// If we are here, it means we are a zombie node and we must stop immediately.
+		panic("snowflake worker lease expired: potential split-brain detected")
+	}
+	return s.Node.Generate()
 }
 
 // Close releases resources
@@ -152,7 +171,7 @@ func allocateWorkerID(ctx context.Context, conn *pgx.Conn, tableName string) (in
 	// Clean up very old entries if needed, or just reuse
 	// Find expired worker
 	var workerID int64
-	var lastTimestamp int64
+	var workerLastTimestamp int64
 
 	// Try to reclaim an expired worker ID
 	queryReclaim := fmt.Sprintf(`
@@ -163,7 +182,16 @@ func allocateWorkerID(ctx context.Context, conn *pgx.Conn, tableName string) (in
 		FOR UPDATE SKIP LOCKED
 	`, tableName)
 
-	err = tx.QueryRow(ctx, queryReclaim, now.Add(-defaultWorkerTimeout)).Scan(&workerID, &lastTimestamp)
+	err = tx.QueryRow(ctx, queryReclaim, now.Add(-defaultWorkerTimeout)).Scan(&workerID, &workerLastTimestamp)
+
+	// Get global max timestamp to prevent clock rollback issues across the cluster
+	var maxGlobalTimestamp *int64
+	errMax := tx.QueryRow(ctx, fmt.Sprintf("SELECT MAX(last_timestamp) FROM %s", tableName)).Scan(&maxGlobalTimestamp)
+
+	globalMaxTs := int64(0)
+	if errMax == nil && maxGlobalTimestamp != nil {
+		globalMaxTs = *maxGlobalTimestamp
+	}
 
 	if err == nil {
 		// Found expired worker, claim it
@@ -179,7 +207,11 @@ func allocateWorkerID(ctx context.Context, conn *pgx.Conn, tableName string) (in
 		if err := tx.Commit(ctx); err != nil {
 			return 0, 0, err
 		}
-		return workerID, lastTimestamp, nil
+		// Return the greater of the worker's last timestamp or the global max timestamp
+		if globalMaxTs > workerLastTimestamp {
+			return workerID, globalMaxTs, nil
+		}
+		return workerID, workerLastTimestamp, nil
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return 0, 0, err
 	}
@@ -222,7 +254,7 @@ func allocateWorkerID(ctx context.Context, conn *pgx.Conn, tableName string) (in
 		return 0, 0, err
 	}
 
-	return nextID, 0, nil
+	return nextID, globalMaxTs, nil
 }
 
 func (s *Snowflake) heartbeat() {
@@ -264,6 +296,8 @@ func (s *Snowflake) updateHeartbeat() {
 		// If heartbeat fails repeatedly, we might want to stop generating IDs?
 		// For now, just ignore transient errors.
 		fmt.Fprintf(os.Stderr, "snowflake heartbeat error: %v\n", err)
+	} else {
+		s.lastHeartbeat.Store(now.UnixNano())
 	}
 }
 

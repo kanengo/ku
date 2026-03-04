@@ -53,14 +53,9 @@ func New(ctx context.Context, config Config) (*Snowflake, error) {
 		config.TableName = defaultTableName
 	}
 
-	connConfig, err := pgx.ParseConfig(config.DSN)
+	conn, err := GetConn(config.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse dsn: %w", err)
-	}
-
-	conn, err := pgx.ConnectConfig(ctx, connConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to postgres: %w", err)
+		return nil, fmt.Errorf("failed to get connection: %w", err)
 	}
 
 	if err := ensureTable(ctx, conn, config.TableName); err != nil {
@@ -145,7 +140,7 @@ func ensureTable(ctx context.Context, conn *pgx.Conn, tableName string) error {
 			worker_id INTEGER PRIMARY KEY,
 			last_timestamp BIGINT NOT NULL,
 			ip_address TEXT NOT NULL,
-			updated_at TIMESTAMP NOT NULL
+			updated_at TIMESTAMP WITH TIME ZONE NOT NULL
 		);
 	`, tableName)
 	_, err := conn.Exec(ctx, query)

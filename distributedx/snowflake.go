@@ -15,6 +15,7 @@ import (
 
 const (
 	defaultTableName        = "snowflake_workers"
+	defaultSchema           = "infra"
 	defaultHeartbeat        = 3 * time.Second
 	defaultWorkerTimeout    = 15 * time.Second
 	maxWorkerID             = snowflakex.MaxWorkerID
@@ -31,6 +32,7 @@ type Snowflake struct {
 	workerID      int64
 	epoch         int64
 	lastHeartbeat atomic.Int64
+	schema        string
 	tableName     string
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -42,6 +44,7 @@ type Config struct {
 	DSN       string
 	TableName string
 	Epoch     int64
+	Schema    string
 }
 
 // New creates a new distributed snowflake instance
@@ -53,17 +56,21 @@ func New(ctx context.Context, config Config) (*Snowflake, error) {
 		config.TableName = defaultTableName
 	}
 
+	if config.Schema == "" {
+		config.Schema = defaultSchema
+	}
+
 	conn, err := GetConn(config.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connection: %w", err)
 	}
 
-	if err := ensureTable(ctx, conn, config.TableName); err != nil {
+	if err := ensureTable(ctx, conn, fmt.Sprintf("%s.%s", config.Schema, config.TableName)); err != nil {
 		conn.Close(ctx)
 		return nil, fmt.Errorf("failed to ensure table: %w", err)
 	}
 
-	workerID, lastTimestamp, err := allocateWorkerID(ctx, conn, config.TableName)
+	workerID, lastTimestamp, err := allocateWorkerID(ctx, conn, fmt.Sprintf("%s.%s", config.Schema, config.TableName))
 	if err != nil {
 		conn.Close(ctx)
 		return nil, fmt.Errorf("failed to allocate worker id: %w", err)
@@ -283,7 +290,7 @@ func (s *Snowflake) updateHeartbeat() {
 		UPDATE %s 
 		SET last_timestamp = $1, updated_at = $2 
 		WHERE worker_id = $3
-	`, s.tableName)
+	`, fmt.Sprintf("%s.%s", s.schema, s.tableName))
 
 	_, err := s.conn.Exec(s.ctx, query, now.UnixMilli(), now, s.workerID)
 	if err != nil {

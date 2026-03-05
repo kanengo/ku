@@ -25,6 +25,8 @@ const (
 	defaultStep = 1000
 )
 
+var defaultSegmentIdTableName = "id_generator"
+
 // Segment represents a range of IDs
 type Segment struct {
 	Start   int64 // Inclusive start ID
@@ -47,6 +49,8 @@ type SegmentBuffer struct {
 
 	conn *pgx.Conn
 	dbMu *sync.Mutex // Shared mutex for DB operations across all buffers using the same conn
+
+	*SegmentIDGen
 }
 
 // SegmentIDGen is the main struct for distributed ID generation
@@ -55,12 +59,30 @@ type SegmentIDGen struct {
 	dbMu    sync.Mutex
 	buffers map[int32]*SegmentBuffer
 	mu      sync.RWMutex
+
+	config SegmentIdConfig
+}
+
+type SegmentIdConfig struct {
+	DSN       string
+	TableName string
+	Schema    string
 }
 
 // NewSegmentIDGen creates a new ID generator instance
 // dsn: Postgres connection string
-func NewSegmentIDGen(dsn string) (*SegmentIDGen, error) {
-	conn, err := GetConn(dsn)
+func NewSegmentIDGen(ctx context.Context, config SegmentIdConfig) (*SegmentIDGen, error) {
+	if config.DSN == "" {
+		return nil, fmt.Errorf("dsn is required")
+	}
+	if config.TableName == "" {
+		config.TableName = defaultSegmentIdTableName
+	}
+	if config.Schema == "" {
+		config.Schema = defaultSchema
+	}
+
+	conn, err := GetConn(config.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connection: %w", err)
 	}
@@ -68,6 +90,7 @@ func NewSegmentIDGen(dsn string) (*SegmentIDGen, error) {
 	return &SegmentIDGen{
 		conn:    conn,
 		buffers: make(map[int32]*SegmentBuffer),
+		config:  config,
 	}, nil
 }
 
@@ -84,10 +107,11 @@ func (g *SegmentIDGen) Init(ctx context.Context, bizTag int32, startId int64, st
 	buffer, exists := g.buffers[bizTag]
 	if !exists {
 		buffer = &SegmentBuffer{
-			BizTag: bizTag,
-			Step:   step,
-			conn:   g.conn,
-			dbMu:   &g.dbMu,
+			BizTag:       bizTag,
+			Step:         step,
+			conn:         g.conn,
+			dbMu:         &g.dbMu,
+			SegmentIDGen: g,
 		}
 		g.buffers[bizTag] = buffer
 	} else {
@@ -112,25 +136,25 @@ func (b *SegmentBuffer) ensureTableAndRecord(ctx context.Context, startId int64,
 	b.dbMu.Lock()
 	defer b.dbMu.Unlock()
 
-	createTableQuery := `
-		CREATE TABLE IF NOT EXISTS id_generator (
+	createTableQuery := fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s.%s (
 			biz_tag INT PRIMARY KEY,
 			max_id BIGINT NOT NULL DEFAULT 0,
 			step INT NOT NULL DEFAULT 1000,
 			description VARCHAR(256),
 			update_time TIMESTAMP WITH TIME ZONE NOT NULL
 		);
-	`
+	`, b.config.Schema, b.config.TableName)
 	if _, err := b.conn.Exec(ctx, createTableQuery); err != nil {
 		return fmt.Errorf("failed to create table: %w", err)
 	}
 
-	query := `
-		INSERT INTO id_generator (biz_tag, max_id, step, update_time)
+	query := fmt.Sprintf(`
+		INSERT INTO %s.%s (biz_tag, max_id, step, update_time)
 		VALUES ($1, $2, $3, NOW())
 		ON CONFLICT (biz_tag) DO UPDATE 
 		SET step = $3, update_time = NOW()
-	`
+	`, b.config.Schema, b.config.TableName)
 	if _, err := b.conn.Exec(ctx, query, b.BizTag, startId, step); err != nil {
 		return fmt.Errorf("failed to initialize id generator: %w", err)
 	}
@@ -271,12 +295,12 @@ func (b *SegmentBuffer) fetchSegment(ctx context.Context) (*Segment, error) {
 
 	// Update max_id and return new values
 	// We increment max_id by step
-	query := `
-		UPDATE id_generator
+	query := fmt.Sprintf(`
+		UPDATE %s.%s
 		SET max_id = max_id + step, update_time = NOW()
 		WHERE biz_tag = $1
 		RETURNING max_id, step
-	`
+	`, b.config.Schema, b.config.TableName)
 
 	// Use QueryRow directly instead of explicit transaction for single update
 	err := b.conn.QueryRow(ctx, query, b.BizTag).Scan(&maxId, &step)

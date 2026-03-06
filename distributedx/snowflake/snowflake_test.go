@@ -1,4 +1,4 @@
-package distributedx
+package snowflake
 
 import (
 	"context"

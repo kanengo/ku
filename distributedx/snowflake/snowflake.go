@@ -1,4 +1,4 @@
-package distributedx
+package snowflake
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/kanengo/ku/distributedx"
 	"github.com/kanengo/ku/snowflakex"
 )
 
@@ -60,7 +61,7 @@ func New(ctx context.Context, config Config) (*Snowflake, error) {
 		config.Schema = defaultSchema
 	}
 
-	conn, err := GetConn(config.DSN)
+	conn, err := distributedx.GetConn(config.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connection: %w", err)
 	}

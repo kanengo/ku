@@ -1,4 +1,4 @@
-package distributedx
+package segment
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/kanengo/ku/distributedx"
 )
 
 // SQL Table Schema:
@@ -22,10 +23,10 @@ CREATE TABLE IF NOT EXISTS id_generator (
 */
 
 const (
-	defaultStep = 1000
+	defaultStep               = 1000
+	defaultSchema             = "infra"
+	defaultSegmentIdTableName = "id_generator"
 )
-
-var defaultSegmentIdTableName = "id_generator"
 
 // Segment represents a range of IDs
 type Segment struct {
@@ -60,10 +61,10 @@ type SegmentIDGen struct {
 	buffers map[int32]*SegmentBuffer
 	mu      sync.RWMutex
 
-	config SegmentIdConfig
+	config Config
 }
 
-type SegmentIdConfig struct {
+type Config struct {
 	DSN       string
 	TableName string
 	Schema    string
@@ -71,7 +72,7 @@ type SegmentIdConfig struct {
 
 // NewSegmentIDGen creates a new ID generator instance
 // dsn: Postgres connection string
-func NewSegmentIDGen(ctx context.Context, config SegmentIdConfig) (*SegmentIDGen, error) {
+func NewSegmentIDGen(ctx context.Context, config Config) (*SegmentIDGen, error) {
 	if config.DSN == "" {
 		return nil, fmt.Errorf("dsn is required")
 	}
@@ -82,7 +83,7 @@ func NewSegmentIDGen(ctx context.Context, config SegmentIdConfig) (*SegmentIDGen
 		config.Schema = defaultSchema
 	}
 
-	conn, err := GetConn(config.DSN)
+	conn, err := distributedx.GetConn(config.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connection: %w", err)
 	}

@@ -46,6 +46,7 @@ type SegmentBuffer struct {
 	isNextReady bool
 	isLoading   bool          // flag to prevent multiple async loads
 	loadCh      chan struct{} // channel to coordinate async loads
+	initCh      chan struct{} // channel to signal initialization completion
 	mu          sync.RWMutex
 
 	conn *pgx.Conn
@@ -104,6 +105,7 @@ func (g *SegmentIDGen) Init(ctx context.Context, bizTag int32, startId int64, st
 		step = defaultStep
 	}
 
+	var isNew bool
 	g.mu.Lock()
 	buffer, exists := g.buffers[bizTag]
 	if !exists {
@@ -113,18 +115,29 @@ func (g *SegmentIDGen) Init(ctx context.Context, bizTag int32, startId int64, st
 			conn:         g.conn,
 			dbMu:         &g.dbMu,
 			SegmentIDGen: g,
+			initCh:       make(chan struct{}),
 		}
 		g.buffers[bizTag] = buffer
+		isNew = true
 	} else {
 		buffer.Step = step
 	}
 	g.mu.Unlock()
+
+	if isNew {
+		defer close(buffer.initCh)
+	}
 
 	// If already initialized, we might just update step or ensure DB record exists?
 	// For simplicity, we always run ensureTableAndRecord and loadCurrentSegment.
 	// If buffer was already running, loadCurrentSegment is safe (locks internally).
 
 	if err := buffer.ensureTableAndRecord(ctx, startId, step); err != nil {
+		if isNew {
+			g.mu.Lock()
+			delete(g.buffers, bizTag)
+			g.mu.Unlock()
+		}
 		return err
 	}
 
@@ -169,7 +182,24 @@ func (g *SegmentIDGen) GetID(ctx context.Context, bizTag int32) (int64, error) {
 	g.mu.RUnlock()
 
 	if !exists {
-		return 0, fmt.Errorf("biz_tag %d not initialized, call Init first", bizTag)
+		if err := g.Init(ctx, bizTag, 0, defaultStep); err != nil {
+			return 0, err
+		}
+
+		g.mu.RLock()
+		buffer, exists = g.buffers[bizTag]
+		g.mu.RUnlock()
+
+		if !exists {
+			return 0, fmt.Errorf("biz_tag %d failed to initialize", bizTag)
+		}
+	}
+
+	// Wait for initialization to complete
+	select {
+	case <-buffer.initCh:
+	case <-ctx.Done():
+		return 0, ctx.Err()
 	}
 
 	return buffer.NextID(ctx)

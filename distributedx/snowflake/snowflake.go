@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
-	"os"
 	"sync/atomic"
 	"time"
 
@@ -105,6 +105,7 @@ func New(ctx context.Context, config Config) (*Snowflake, error) {
 		ctx:       ctx,
 		cancel:    cancel,
 		done:      make(chan struct{}),
+		schema:    config.Schema,
 	}
 	sf.lastHeartbeat.Store(time.Now().UnixNano())
 
@@ -298,7 +299,7 @@ func (s *Snowflake) updateHeartbeat() {
 		// Log error?
 		// If heartbeat fails repeatedly, we might want to stop generating IDs?
 		// For now, just ignore transient errors.
-		fmt.Fprintf(os.Stderr, "snowflake heartbeat error: %v\n", err)
+		slog.Error("snowflake heartbeat error", "err", err)
 	} else {
 		s.lastHeartbeat.Store(now.UnixNano())
 	}

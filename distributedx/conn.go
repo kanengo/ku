@@ -21,6 +21,7 @@ func GetConn(dsn string) (*pgx.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse dsn: %w", err)
 	}
+	connConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
 
 	conn, err := pgx.ConnectConfig(context.Background(), connConfig)
 	if err != nil {

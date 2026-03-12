@@ -292,7 +292,7 @@ func (s *Snowflake) updateHeartbeat() {
 		UPDATE %s 
 		SET last_timestamp = $1, updated_at = $2 
 		WHERE worker_id = $3
-	`, fmt.Sprintf("%s.%s", s.schema, s.tableName))
+	`, fmt.Sprintf(`"%s"."%s"`, s.schema, s.tableName))
 
 	_, err := s.conn.Exec(s.ctx, query, now.UnixMilli(), now, s.workerID)
 	if err != nil {

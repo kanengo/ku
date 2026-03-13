@@ -3,9 +3,12 @@ package mqx
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/bytedance/sonic"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
@@ -331,8 +334,8 @@ func newTestRedisClient(t *testing.T) *redis.Client {
 	t.Helper()
 
 	rdb := redis.NewClient(&redis.Options{
-		Addr:         "127.0.0.1:6379",
-		Password:     "redis-test-0",
+		Addr:         "43.133.32.63:6379",
+		Password:     "NxAAj9edpp3J6zJN7xG6",
 		DB:           15,
 		MaxRetries:   0,
 		DialTimeout:  300 * time.Millisecond,
@@ -385,4 +388,81 @@ func waitForCondition(t *testing.T, timeout time.Duration, fn func() bool) {
 
 func testStreamName(prefix string) string {
 	return prefix + ":" + uuid.NewString()
+}
+
+func TestRedisPubSubConcurrency(t *testing.T) {
+	ctx := context.Background()
+	rdb1 := newTestRedisClient(t)
+	rdb2 := newTestRedisClient(t)
+	rdb3 := newTestRedisClient(t)
+
+	ps := NewRedisPubSub(rdb1,
+		WithConcurrency(2),
+	)
+
+	sub1 := NewRedisPubSub(rdb2,
+		WithConcurrency(2),
+	)
+
+	sub2 := NewRedisPubSub(rdb3,
+		WithConcurrency(2),
+	)
+
+	type testMessage struct {
+		Id int64 `json:"id"`
+	}
+
+	sub1.Subscribe(ctx, &SubscribeRequest{
+		Topic:         "test-ps",
+		ConsumerGroup: "test-group",
+		Handler: func(ctx context.Context, msg *Message) error {
+			var tm testMessage
+			if err := sonic.Unmarshal(msg.Data, &tm); err != nil {
+				slog.ErrorContext(ctx, "unmarshal message failed", "err", err)
+				return err
+			}
+			slog.InfoContext(ctx, "received message from sub1", "msg", tm)
+			return nil
+		},
+	})
+
+	sub2.Subscribe(ctx, &SubscribeRequest{
+		Topic:         "test-ps",
+		ConsumerGroup: "test-group",
+		Handler: func(ctx context.Context, msg *Message) error {
+			var tm testMessage
+			if err := sonic.Unmarshal(msg.Data, &tm); err != nil {
+				slog.ErrorContext(ctx, "unmarshal message failed", "err", err)
+				return err
+			}
+			slog.InfoContext(ctx, "received message from sub2", "msg", tm)
+			return nil
+		},
+	})
+
+	time.Sleep(1 * time.Second)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		for i := int64(0); i < 10; i++ {
+			msg := &testMessage{Id: i}
+			data, err := sonic.Marshal(msg)
+			if err != nil {
+				t.Fatalf("marshal message failed: %v", err)
+			}
+			if err := ps.Publish(ctx, &PublishRequest{
+				Topic: "test-ps",
+				Data:  data,
+			}); err != nil {
+				t.Fatalf("publish message failed: %v", err)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+
+	wg.Wait()
+
+	time.Sleep(3 * time.Second)
 }

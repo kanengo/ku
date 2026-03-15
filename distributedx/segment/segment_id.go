@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kanengo/ku/distributedx"
 )
 
@@ -49,7 +50,7 @@ type SegmentBuffer struct {
 	initCh      chan struct{} // channel to signal initialization completion
 	mu          sync.RWMutex
 
-	conn *pgx.Conn
+	conn *pgxpool.Pool
 	dbMu *sync.Mutex // Shared mutex for DB operations across all buffers using the same conn
 
 	*SegmentIDGen
@@ -57,7 +58,7 @@ type SegmentBuffer struct {
 
 // SegmentIDGen is the main struct for distributed ID generation
 type SegmentIDGen struct {
-	conn    *pgx.Conn
+	conn    *pgxpool.Pool
 	dbMu    sync.Mutex
 	buffers map[int32]*SegmentBuffer
 	mu      sync.RWMutex

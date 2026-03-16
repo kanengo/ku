@@ -3,15 +3,18 @@ package mqx
 import "context"
 
 type Message struct {
+	ID          string
 	Topic       string
 	Data        []byte
 	Metadata    map[string]string
 	ContentType string
+	SentAt      int64 // ms
 }
 
 type MessageHandler func(context.Context, *Message) error
 
 type PublishRequest struct {
+	ID          string
 	Topic       string
 	Data        []byte
 	Metadata    map[string]string

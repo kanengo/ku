@@ -30,9 +30,11 @@ var (
 )
 
 type redisEnvelope struct {
+	ID          string
 	Data        []byte            `json:"data"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
 	ContentType string            `json:"content_type,omitempty"`
+	SentAt      int64             `json:"sent_at,omitempty"`
 }
 
 type redisPubSubOptions struct {
@@ -137,9 +139,11 @@ func (p *RedisPubSub) Publish(ctx context.Context, req *PublishRequest) error {
 	}
 
 	payload, err := sonic.MarshalString(redisEnvelope{
+		ID:          req.ID,
 		Data:        req.Data,
 		Metadata:    req.Metadata,
 		ContentType: req.ContentType,
+		SentAt:      time.Now().UnixMilli(),
 	})
 	if err != nil {
 		return err
@@ -561,11 +565,18 @@ func decodeRedisMessage(topic string, msg redis.XMessage) (*Message, error) {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidPayload, err)
 	}
 
+	id := msg.ID
+	if envelope.ID != "" {
+		id = envelope.ID
+	}
+
 	return &Message{
+		ID:          id,
 		Topic:       topic,
 		Data:        envelope.Data,
 		Metadata:    envelope.Metadata,
 		ContentType: envelope.ContentType,
+		SentAt:      envelope.SentAt,
 	}, nil
 }
 

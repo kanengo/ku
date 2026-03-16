@@ -19,6 +19,8 @@ type PublishRequest struct {
 	Data        []byte
 	Metadata    map[string]string
 	ContentType string
+
+	MaxLenApprox int64
 }
 
 type SubscribeRequest struct {

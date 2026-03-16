@@ -160,6 +160,11 @@ func (p *RedisPubSub) Publish(ctx context.Context, req *PublishRequest) error {
 		args.Approx = true
 	}
 
+	if req.MaxLenApprox > 0 {
+		args.MaxLen = req.MaxLenApprox
+		args.Approx = true
+	}
+
 	return p.client.XAdd(ctx, args).Err()
 }
 

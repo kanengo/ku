@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kanengo/ku/distributedx"
 	"github.com/kanengo/ku/snowflakex"
 )
@@ -29,7 +30,7 @@ const (
 // Snowflake represents a distributed snowflake ID generator backed by PostgreSQL
 type Snowflake struct {
 	*snowflakex.Node
-	conn          *pgx.Conn
+	conn          *pgxpool.Pool
 	workerID      int64
 	epoch         int64
 	lastHeartbeat atomic.Int64
@@ -66,14 +67,14 @@ func New(ctx context.Context, config Config) (*Snowflake, error) {
 		return nil, fmt.Errorf("failed to get connection: %w", err)
 	}
 
-	if err := ensureTable(ctx, conn, fmt.Sprintf("%s.%s", config.Schema, config.TableName)); err != nil {
-		conn.Close(ctx)
+	if err = ensureTable(ctx, conn, fmt.Sprintf("%s.%s", config.Schema, config.TableName)); err != nil {
+		conn.Close()
 		return nil, fmt.Errorf("failed to ensure table: %w", err)
 	}
 
 	workerID, lastTimestamp, err := allocateWorkerID(ctx, conn, fmt.Sprintf("%s.%s", config.Schema, config.TableName))
 	if err != nil {
-		conn.Close(ctx)
+		conn.Close()
 		return nil, fmt.Errorf("failed to allocate worker id: %w", err)
 	}
 
@@ -83,7 +84,7 @@ func New(ctx context.Context, config Config) (*Snowflake, error) {
 		// Wait until clock catches up
 		waitTime := time.Duration(lastTimestamp-currentTimestamp) * time.Millisecond
 		if waitTime > time.Second*5 { // If wait time is too long, fail
-			conn.Close(ctx)
+			conn.Close()
 			return nil, fmt.Errorf("clock moved backwards by %v, refusing to start", waitTime)
 		}
 		time.Sleep(waitTime + time.Millisecond)
@@ -91,7 +92,6 @@ func New(ctx context.Context, config Config) (*Snowflake, error) {
 
 	node, err := snowflakex.NewNode(workerID, config.Epoch)
 	if err != nil {
-		conn.Close(ctx)
 		return nil, fmt.Errorf("failed to create snowflake node: %w", err)
 	}
 
@@ -133,9 +133,7 @@ func (s *Snowflake) Close() {
 	<-s.done
 	// We need a context to close the connection, but Close() is usually deferred
 	// and context might be cancelled. Use a background context with timeout.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	s.conn.Close(ctx)
+	s.conn.Close()
 }
 
 // GetWorkerID returns the current worker ID
@@ -143,7 +141,7 @@ func (s *Snowflake) GetWorkerID() int64 {
 	return s.workerID
 }
 
-func ensureTable(ctx context.Context, conn *pgx.Conn, tableName string) error {
+func ensureTable(ctx context.Context, conn *pgxpool.Pool, tableName string) error {
 	query := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %s (
 			worker_id INTEGER PRIMARY KEY,
@@ -156,7 +154,7 @@ func ensureTable(ctx context.Context, conn *pgx.Conn, tableName string) error {
 	return err
 }
 
-func allocateWorkerID(ctx context.Context, conn *pgx.Conn, tableName string) (int64, int64, error) {
+func allocateWorkerID(ctx context.Context, conn *pgxpool.Pool, tableName string) (int64, int64, error) {
 	ip, _ := getLocalIP()
 	now := time.Now()
 

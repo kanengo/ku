@@ -2,15 +2,17 @@ package mqx
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/bytedance/sonic"
+	"github.com/kanengo/ku/unsafex"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -43,12 +45,12 @@ type redisPubSubOptions struct {
 }
 
 var defaultRedisPubSubOptions = redisPubSubOptions{
-	blockTimeout:      time.Second,
-	readCount:         16,
-	concurrency:       1,
+	blockTimeout:      time.Second * 2,
+	readCount:         int64(runtime.NumCPU() * 2),
+	concurrency:       runtime.NumCPU(),
 	processingTimeout: 30 * time.Second,
 	redeliverInterval: 5 * time.Second,
-	maxLenApprox:      0,
+	maxLenApprox:      10000,
 }
 
 type RedisPubSubOption func(*redisPubSubOptions)
@@ -134,7 +136,7 @@ func (p *RedisPubSub) Publish(ctx context.Context, req *PublishRequest) error {
 		return ErrEmptyTopic
 	}
 
-	payload, err := json.Marshal(redisEnvelope{
+	payload, err := sonic.MarshalString(redisEnvelope{
 		Data:        req.Data,
 		Metadata:    req.Metadata,
 		ContentType: req.ContentType,
@@ -146,7 +148,7 @@ func (p *RedisPubSub) Publish(ctx context.Context, req *PublishRequest) error {
 	args := &redis.XAddArgs{
 		Stream: req.Topic,
 		Values: map[string]any{
-			redisStreamPayloadField: string(payload),
+			redisStreamPayloadField: payload,
 		},
 	}
 	if p.opts.maxLenApprox > 0 {
@@ -555,7 +557,7 @@ func decodeRedisMessage(topic string, msg redis.XMessage) (*Message, error) {
 	}
 
 	var envelope redisEnvelope
-	if err := json.Unmarshal([]byte(payload), &envelope); err != nil {
+	if err := sonic.UnmarshalString(payload, &envelope); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidPayload, err)
 	}
 
@@ -572,7 +574,7 @@ func payloadString(v any) (string, error) {
 	case string:
 		return payload, nil
 	case []byte:
-		return string(payload), nil
+		return unsafex.Bytes2String(payload), nil
 	default:
 		return "", fmt.Errorf("%w: unexpected payload type %T", ErrInvalidPayload, v)
 	}

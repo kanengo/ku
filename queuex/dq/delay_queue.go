@@ -4,9 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync/atomic"
-
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bytedance/gopkg/util/logger"
@@ -39,15 +38,22 @@ func WithQueue(queue string) BatchDelayQueueOption {
 
 func WithPollingBatchSize(batchSize int64) BatchDelayQueueOption {
 	return func(o *BatchDelayQOptions) {
+		if batchSize <= 0 {
+			return
+		}
 		o.batchSize = batchSize
 	}
 }
 
 func WithPollingInterval(pollingInterval time.Duration) BatchDelayQueueOption {
 	return func(o *BatchDelayQOptions) {
+		if pollingInterval <= 0 {
+			return
+		}
 		o.pollingInterval = pollingInterval
 	}
 }
+
 func WithShardNum(shardNum int) BatchDelayQueueOption {
 	return func(o *BatchDelayQOptions) {
 		if shardNum <= 0 {
@@ -59,18 +65,27 @@ func WithShardNum(shardNum int) BatchDelayQueueOption {
 
 func WithExpiration(exp time.Duration) BatchDelayQueueOption {
 	return func(o *BatchDelayQOptions) {
+		if exp <= 0 {
+			return
+		}
 		o.expiration = exp
 	}
 }
 
 func WithConcurrency(num int) BatchDelayQueueOption {
 	return func(o *BatchDelayQOptions) {
+		if num <= 0 {
+			return
+		}
 		o.concurrency = num
 	}
 }
 
 func WithQueueDepth(depth int) BatchDelayQueueOption {
 	return func(o *BatchDelayQOptions) {
+		if depth < 0 {
+			return
+		}
 		o.queueDepth = depth
 	}
 }
@@ -163,15 +178,26 @@ func (bq *BatchDelayQueue) retryQueue(shard int) string {
 	return fmt.Sprintf("bdq:{%s:%d}:retry", bq.opts.queue, shard)
 }
 
+func (bq *BatchDelayQueue) retryQueueByShardKey(shardKey string) string {
+	return shardKey + ":retry"
+}
+
 func (bq *BatchDelayQueue) pendingQueue(shard int) string {
 	return fmt.Sprintf("bdq:{%s:%d}:pending", bq.opts.queue, shard)
 }
 
+func (bq *BatchDelayQueue) pendingQueueByShardKey(shardKey string) string {
+	return shardKey + ":pending"
+}
+
 func (bq *BatchDelayQueue) taskKey(shardKey string, id string) string {
-	return fmt.Sprintf("%s:%s", shardKey, id)
+	return shardKey + ":" + id
 }
 
 func (bq *BatchDelayQueue) enqueueByOneShard(ctx context.Context, tasks ...DelayTask) error {
+	if len(tasks) == 0 {
+		return nil
+	}
 	fields := make([]any, 0, len(tasks)*2)
 	zs := make([]redis.Z, 0, len(tasks))
 	for _, v := range tasks {
@@ -195,6 +221,9 @@ func (bq *BatchDelayQueue) enqueueByOneShard(ctx context.Context, tasks ...Delay
 }
 
 func (bq *BatchDelayQueue) Enqueue(ctx context.Context, tasks ...DelayTask) error {
+	if len(tasks) == 0 {
+		return nil
+	}
 	for i := range tasks {
 		if tasks[i].Id == "" {
 			tasks[i].Id = bq.newTaskId()
@@ -236,7 +265,9 @@ func (bq *BatchDelayQueue) Enqueue(ctx context.Context, tasks ...DelayTask) erro
 
 var removeTaskScript = redis.NewScript(`
 redis.call("ZREM", KEYS[1], ARGV[1])
-redis.call("DEL", KEYS[2])
+redis.call("ZREM", KEYS[2], ARGV[1])
+redis.call("LREM", KEYS[3], 0, ARGV[1])
+redis.call("DEL", KEYS[4])
 return 0
 `)
 
@@ -250,7 +281,12 @@ func (bq *BatchDelayQueue) RemoveTask(ctx context.Context, key string) error {
 
 	taskKey := bq.taskKey(shardKey, key)
 
-	return removeTaskScript.Run(ctx, bq.rdb, []string{shardKey, taskKey}, key).Err()
+	return removeTaskScript.Run(ctx, bq.rdb, []string{
+		shardKey,
+		bq.pendingQueueByShardKey(shardKey),
+		bq.retryQueueByShardKey(shardKey),
+		taskKey,
+	}, key).Err()
 }
 
 var batchDelayQueuePollScript = redis.NewScript(`
@@ -267,7 +303,7 @@ if retryNum >= batchSize then
 	return values
 end
 local left = batchSize - retryNum
-local values2 = redis.call("ZRANGE", KEYS[2], "-inf", ARGV[2], "BYSCORE", "LIMIT", 0, left - 1)
+local values2 = redis.call("ZRANGE", KEYS[2], "-inf", ARGV[2], "BYSCORE", "LIMIT", 0, left)
 if #values2 > 0 then
 	redis.call("ZREMRANGEBYRANK",KEYS[2], 0, #values2 - 1)
 end
@@ -292,6 +328,37 @@ end
 return values
 `)
 
+var cleanupMissingDelayTasksScript = redis.NewScript(`
+for i, id in ipairs(ARGV) do
+	redis.call("ZREM", KEYS[1], id)
+	redis.call("ZREM", KEYS[2], id)
+	redis.call("LREM", KEYS[3], 0, id)
+	redis.call("DEL", KEYS[i + 3])
+end
+return #ARGV
+`)
+
+func (bq *BatchDelayQueue) cleanupMissingTasks(ctx context.Context, shard int, ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+
+	shardKey := bq.queue(shard)
+	keys := stringslicepool.Get(len(ids) + 3)[:0]
+	defer stringslicepool.Put(keys)
+	keys = append(keys, shardKey, bq.pendingQueue(shard), bq.retryQueue(shard))
+
+	args := make([]any, 0, len(ids))
+	for _, id := range ids {
+		keys = append(keys, bq.taskKey(shardKey, id))
+		args = append(args, id)
+	}
+
+	if err := cleanupMissingDelayTasksScript.Run(ctx, bq.rdb, keys, args...).Err(); err != nil {
+		contextx.Logger(ctx).Warn("[BatchDelayQueue] cleanup missing task failed", "err", err, "queue", bq.opts.queue, "shard", shard)
+	}
+}
+
 func (bq *BatchDelayQueue) run(ctx context.Context, shard int) {
 	intervalTicker := time.NewTicker(bq.opts.pollingInterval)
 	defer intervalTicker.Stop()
@@ -304,62 +371,72 @@ func (bq *BatchDelayQueue) run(ctx context.Context, shard int) {
 		case <-intervalTicker.C:
 		}
 
-		if ctx.Err() != nil {
-			break
-		}
-		now := time.Now()
-		values, err := batchDelayQueuePollScript.Run(ctx, bq.rdb, []string{
-			bq.retryQueue(shard),
-			bq.queue(shard),
-			bq.pendingQueue(shard),
-		}, bq.opts.batchSize, now.Unix(),
-			now.Add(bq.opts.redeliverInterval).Unix()).StringSlice()
-		if err != nil {
-			if !errors.Is(err, redis.Nil) {
-				logger.Warn("[BatchDelayQueue] poll", "err", err, "queue", bq.opts.queue, "shard", shard)
+		for {
+			if ctx.Err() != nil {
+				return
 			}
-			continue
-		}
-
-		if len(values) == 0 {
-			continue
-		}
-		taskKeys := slicex.Map(values, func(id string, _ int) string {
-			return bq.taskKey(shardKey, id)
-		})
-
-		taskContentList, err := bq.rdb.MGet(ctx, taskKeys...).Result()
-		if err != nil {
-			logger.Warn("[BatchDelayQueue] mget failed", "err", err, "queue", bq.opts.queue, "shard", shard)
-			bq.rdb.RPush(ctx, bq.retryQueue(shard), slicex.Map(values, func(item string, _ int) any {
-				return item
-			})...)
-			continue
-		}
-		ts := make([]Task, 0, len(taskContentList))
-		for i, content := range taskContentList {
-			if content == nil {
-				continue
+			now := time.Now()
+			values, err := batchDelayQueuePollScript.Run(ctx, bq.rdb, []string{
+				bq.retryQueue(shard),
+				bq.queue(shard),
+				bq.pendingQueue(shard),
+			}, bq.opts.batchSize, now.Unix(),
+				now.Add(bq.opts.redeliverInterval).Unix()).StringSlice()
+			if err != nil {
+				if !errors.Is(err, redis.Nil) {
+					logger.Warn("[BatchDelayQueue] poll", "err", err, "queue", bq.opts.queue, "shard", shard)
+				}
+				break
 			}
 
-			ts = append(ts, Task{
-				Id:   values[i],
-				Data: content.(string),
+			if len(values) == 0 {
+				break
+			}
+			taskKeys := slicex.Map(values, func(id string, _ int) string {
+				return bq.taskKey(shardKey, id)
 			})
+
+			taskContentList, err := bq.rdb.MGet(ctx, taskKeys...).Result()
+			if err != nil {
+				logger.Warn("[BatchDelayQueue] mget failed", "err", err, "queue", bq.opts.queue, "shard", shard)
+				break
+			}
+			ts := make([]Task, 0, len(taskContentList))
+			missingIDs := make([]string, 0)
+			for i, content := range taskContentList {
+				if content == nil {
+					missingIDs = append(missingIDs, values[i])
+					continue
+				}
+
+				data, ok := content.(string)
+				if !ok {
+					logger.Warn("[BatchDelayQueue] unexpected task payload type", "queue", bq.opts.queue, "shard", shard, "id", values[i])
+					missingIDs = append(missingIDs, values[i])
+					continue
+				}
+
+				ts = append(ts, Task{
+					Id:   values[i],
+					Data: data,
+				})
+			}
+			bq.cleanupMissingTasks(ctx, shard, missingIDs)
+			if len(ts) != 0 {
+				select {
+				case bq.queueCh <- wrappedTasks{
+					ctx:   ctx,
+					ts:    ts,
+					shard: shard,
+				}:
+				case <-ctx.Done():
+					return
+				}
+			}
+			if int64(len(values)) < bq.opts.batchSize {
+				break
+			}
 		}
-		if len(ts) == 0 {
-			continue
-		}
-		select {
-		case bq.queueCh <- wrappedTasks{
-			ctx:   ctx,
-			ts:    ts,
-			shard: shard,
-		}:
-		case <-ctx.Done():
-			return
-		}
-		//
 	}
 }
 
@@ -381,6 +458,16 @@ func (bq *BatchDelayQueue) worker(handler func(ctx context.Context, tasks []Task
 	}
 }
 
+var ackDelayTasksScript = redis.NewScript(`
+for _, id in ipairs(ARGV) do
+	redis.call("ZREM", KEYS[1], id)
+end
+for i = 2, #KEYS do
+	redis.call("DEL", KEYS[i])
+end
+return #ARGV
+`)
+
 func (bq *BatchDelayQueue) processTasks(msg wrappedTasks, handler func(ctx context.Context, tasks []Task) []string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -392,26 +479,24 @@ func (bq *BatchDelayQueue) processTasks(msg wrappedTasks, handler func(ctx conte
 		return
 	}
 	shardKey := bq.queue(msg.shard)
-	doneList := stringslicepool.Get(len(ackList))[:0]
-	stringslicepool.Put(doneList)
+	doneList := stringslicepool.Get(len(ackList) + 1)[:0]
 	defer stringslicepool.Put(doneList)
+	doneList = append(doneList, bq.pendingQueue(msg.shard))
+	args := make([]any, 0, len(ackList))
 	for _, id := range ackList {
 		doneList = append(doneList, bq.taskKey(shardKey, id))
+		args = append(args, id)
 	}
 
-	pl := bq.rdb.Pipeline()
-	pl.Del(msg.ctx, doneList...)
-	pl.ZRem(msg.ctx, bq.pendingQueue(msg.shard),
-		slicex.Map(ackList, func(id string, _ int) any {
-			return id
-		})...,
-	)
-	pl.Exec(msg.ctx)
+	if err := ackDelayTasksScript.Run(msg.ctx, bq.rdb, doneList, args...).Err(); err != nil {
+		logger.Error("[BatchDelayQueue] ack failed", "err", err, "queue", bq.opts.queue, "shard", msg.shard)
+	}
 }
 
 func (bq *BatchDelayQueue) reclaimPendingMessagesLoop(ctx context.Context, shard int) {
 	bq.reclaimPendingMessages(ctx, shard)
 	ticker := time.NewTicker(bq.opts.redeliverInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -424,7 +509,7 @@ func (bq *BatchDelayQueue) reclaimPendingMessagesLoop(ctx context.Context, shard
 
 var reclaimPendingMessagesScript = redis.NewScript(`
 local batchSize = tonumber(ARGV[1])
-local values = redis.call("ZRANGE", KEYS[1], "-inf", ARGV[2], "BYSCORE", "LIMIT", 0, batchSize - 1)
+local values = redis.call("ZRANGE", KEYS[1], "-inf", ARGV[2], "BYSCORE", "LIMIT", 0, batchSize)
 if #values > 0 then
 	redis.call("ZREMRANGEBYRANK",KEYS[1], 0, #values - 1)
 	redis.call("LPUSH", KEYS[2], unpack(values))

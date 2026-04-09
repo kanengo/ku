@@ -260,6 +260,10 @@ func TestHelpersAndKeys(t *testing.T) {
 	assert.Equal(t, "jobx:{test_queue:3}:ready", q.readyKey(3))
 	assert.Equal(t, "jobx:{test_queue:3}:pending", q.pendingKey(3))
 	assert.Equal(t, "jobx:{test_queue:3}:payload:job-42", q.payloadKey(3, id))
+
+	ts := time.Date(2026, 4, 9, 10, 11, 12, 123456789, time.FixedZone("UTC+8", 8*3600))
+	assert.Equal(t, time.Date(2026, 4, 9, 2, 11, 12, 123000000, time.UTC), normalizeTimestamp(ts))
+	assert.True(t, normalizeTimestamp(time.Time{}).IsZero())
 }
 
 func TestEnqueueBatchGuards(t *testing.T) {
@@ -331,6 +335,18 @@ func TestStartDeleteAndShutdownGuards(t *testing.T) {
 		assert.Contains(t, err.Error(), "empty id")
 	})
 
+	t.Run("delete batch empty id", func(t *testing.T) {
+		q := newTestQueue()
+		err := q.DeleteBatch(ctx, []string{"job-1", ""})
+		require.ErrorIs(t, err, ErrInvalidJob)
+		assert.Contains(t, err.Error(), "empty id")
+	})
+
+	t.Run("delete batch empty slice", func(t *testing.T) {
+		q := newTestQueue()
+		require.NoError(t, q.DeleteBatch(ctx, nil))
+	})
+
 	t.Run("shutdown without start", func(t *testing.T) {
 		q := newTestQueue()
 		require.NoError(t, q.Shutdown())
@@ -352,6 +368,17 @@ func TestProcessJobsAndWorkerLoop(t *testing.T) {
 
 	t.Run("worker loop consumes queue", func(t *testing.T) {
 		q := newTestQueue()
+		runAt := time.Now().UTC().Truncate(time.Millisecond)
+		payload, err := sonic.MarshalString(redisJobEnvelope{
+			ID:      "job-1",
+			RunAt:   runAt.UnixMilli(),
+			Payload: []byte("payload"),
+		})
+		require.NoError(t, err)
+		q.rdb = &fakeCmdable{
+			pollIDs:    []interface{}{"job-1"},
+			mgetValues: []interface{}{payload},
+		}
 		runCtx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
@@ -362,8 +389,7 @@ func TestProcessJobsAndWorkerLoop(t *testing.T) {
 			return nil
 		})
 
-		want := []Job{{ID: "job-1", RunAt: time.Now()}}
-		q.queueCh <- wrappedJobs{ctx: ctx, shard: 0, jobs: want}
+		want := []Job{{ID: "job-1", RunAt: runAt, Payload: []byte("payload")}}
 
 		select {
 		case got := <-handled:
@@ -457,34 +483,4 @@ func TestPollRedisFiltersInvalidPayloadsAndCleansUp(t *testing.T) {
 	assert.True(t, strings.Contains(rdb.scriptRuns[0].script, `redis.call("ZRANGE", KEYS[1], "-inf", now, "BYSCORE"`))
 	assert.Equal(t, []interface{}{"missing", "bad-type", "bad-json"}, rdb.scriptRuns[1].args)
 	assert.Equal(t, []interface{}{"expired"}, rdb.scriptRuns[2].args)
-}
-
-func TestPollUntilDrainedRequeuesWhenQueueIsFull(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	rdb := &fakeCmdable{
-		pollIDs: []interface{}{"job-1"},
-	}
-	runAt := time.Now().UTC().Truncate(time.Millisecond)
-	payload, err := sonic.MarshalString(redisJobEnvelope{
-		ID:      "job-1",
-		RunAt:   runAt.UnixMilli(),
-		Payload: []byte("payload"),
-	})
-	require.NoError(t, err)
-	rdb.mgetValues = []interface{}{payload}
-
-	q := newTestQueue()
-	q.rdb = rdb
-	q.queueCh = make(chan wrappedJobs, 1)
-	q.queueCh <- wrappedJobs{ctx: ctx, shard: 0, jobs: []Job{{ID: "occupied", RunAt: time.Now()}}}
-
-	q.pollUntilDrained(ctx, ctx, q.shard("job-1"))
-
-	require.Len(t, rdb.scriptRuns, 2)
-	assert.True(t, strings.Contains(rdb.scriptRuns[0].script, `redis.call("ZRANGE", KEYS[1], "-inf", now, "BYSCORE"`))
-	assert.Equal(t, requeueJobsScriptSource, rdb.scriptRuns[1].script)
-	assert.Equal(t, []interface{}{"job-1", runAt.UnixMilli()}, rdb.scriptRuns[1].args)
-	assert.Len(t, q.queueCh, 1)
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"math/rand/v2"
 	"regexp"
 	"strconv"
 	"sync"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kanengo/ku/contextx"
 	"github.com/kanengo/ku/distributedx"
@@ -35,6 +37,8 @@ const (
 	statusPending   = "pending"
 	statusSucceeded = "succeeded"
 	statusCancelled = "cancelled"
+
+	timestampPrecision = time.Millisecond
 
 	defaultQueueName       = "default"
 	defaultSchema          = "infra"
@@ -262,27 +266,24 @@ type DelayQueue struct {
 	runCancel  context.CancelFunc
 	wg         sync.WaitGroup
 
-	started atomic.Bool
-	closed  atomic.Bool
+	started  atomic.Bool
+	closed   atomic.Bool
+	shardSeq atomic.Uint64
 
 	closeSnowflakeOnce sync.Once
 }
 
 type wrappedJobs struct {
-	ctx   context.Context
-	shard int
-	jobs  []Job
+	ctx        context.Context
+	shard      int
+	leaseUntil time.Time
+	jobs       []Job
 }
 
 type redisJobEnvelope struct {
 	ID      string `json:"id"`
 	RunAt   int64  `json:"run_at"`
 	Payload []byte `json:"payload"`
-}
-
-type jobIdentity struct {
-	ID    string
-	RunAt time.Time
 }
 
 func NewDelayQueue(ctx context.Context, dsn string, rdb redis.Cmdable, opts ...Option) (*DelayQueue, error) {
@@ -349,6 +350,8 @@ func NewDelayQueue(ctx context.Context, dsn string, rdb redis.Cmdable, opts ...O
 		}
 	}
 
+	q.shardSeq.Store(rand.Uint64() % uint64(options.shardNum))
+
 	return q, nil
 }
 
@@ -397,6 +400,17 @@ func durationInterval(d time.Duration) string {
 	return fmt.Sprintf("%d milliseconds", ms)
 }
 
+func normalizeTimestamp(t time.Time) time.Time {
+	if t.IsZero() {
+		return t
+	}
+	return t.UTC().Truncate(timestampPrecision)
+}
+
+func nowTimestamp() time.Time {
+	return normalizeTimestamp(time.Now())
+}
+
 func (q *DelayQueue) ensureSchema(ctx context.Context) error {
 	if _, err := q.pg.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS "%s"`, q.opts.schema)); err != nil {
 		return err
@@ -413,11 +427,15 @@ CREATE TABLE IF NOT EXISTS %s (
 	payload BYTEA NOT NULL,
 	status TEXT NOT NULL,
 	promoted_at TIMESTAMPTZ,
+	lease_until TIMESTAMPTZ,
 	attempts BIGINT NOT NULL DEFAULT 0,
 	created_at TIMESTAMPTZ NOT NULL,
 	updated_at TIMESTAMPTZ NOT NULL
 )`, q.fullTableName())
 	if _, err := q.pg.Exec(ctx, createTable); err != nil {
+		return err
+	}
+	if _, err := q.pg.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS lease_until TIMESTAMPTZ`, q.fullTableName())); err != nil {
 		return err
 	}
 
@@ -470,7 +488,7 @@ func (q *DelayQueue) EnqueueBatch(ctx context.Context, jobs []Job) ([]string, er
 		return nil, nil
 	}
 
-	now := time.Now().UTC()
+	now := nowTimestamp()
 	normalized := make([]Job, len(jobs))
 	ids := make([]string, len(jobs))
 	for i, job := range jobs {
@@ -486,27 +504,35 @@ func (q *DelayQueue) EnqueueBatch(ctx context.Context, jobs []Job) ([]string, er
 		if job.Payload == nil {
 			job.Payload = []byte{}
 		}
-		job.RunAt = job.RunAt.UTC()
+		job.RunAt = normalizeTimestamp(job.RunAt)
 		normalized[i] = job
 		ids[i] = job.ID
 	}
 
-	tx, err := q.pg.Begin(ctx)
+	rows := make([][]any, len(normalized))
+	for i, job := range normalized {
+		rows[i] = []any{
+			q.opts.queue,
+			job.ID,
+			job.RunAt,
+			job.Payload,
+			statusPending,
+			now,
+			now,
+		}
+	}
+
+	inserted, err := q.pg.CopyFrom(
+		ctx,
+		pgx.Identifier{q.opts.schema, q.opts.table},
+		[]string{"queue", "id", "run_at", "payload", "status", "created_at", "updated_at"},
+		pgx.CopyFromRows(rows),
+	)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback(ctx)
-
-	insertSQL := fmt.Sprintf(`
-INSERT INTO %s (queue, id, run_at, payload, status, created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $6)`, q.fullTableName())
-	for _, job := range normalized {
-		if _, err := tx.Exec(ctx, insertSQL, q.opts.queue, job.ID, job.RunAt, job.Payload, statusPending, now); err != nil {
-			return nil, err
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
+	if inserted != int64(len(rows)) {
+		return nil, fmt.Errorf("jobx: copied %d rows, expected %d", inserted, len(rows))
 	}
 
 	hotJobs := make([]Job, 0, len(normalized))
@@ -538,7 +564,6 @@ func (q *DelayQueue) Start(ctx context.Context, handler Handler) error {
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
-	handlerCtx := runCtx
 	q.startMu.Lock()
 	q.runCancel = cancel
 	q.startMu.Unlock()
@@ -548,12 +573,6 @@ func (q *DelayQueue) Start(ctx context.Context, handler Handler) error {
 	})
 
 	for shard := range q.opts.shardNum {
-		q.wg.Add(1)
-		go func(shard int) {
-			defer q.wg.Done()
-			q.pollLoop(runCtx, handlerCtx, shard)
-		}(shard)
-
 		q.wg.Add(1)
 		go func(shard int) {
 			defer q.wg.Done()
@@ -606,18 +625,49 @@ func (q *DelayQueue) closeSnowflake() {
 }
 
 func (q *DelayQueue) Delete(ctx context.Context, id string) error {
-	if id == "" {
-		return fmt.Errorf("%w: empty id", ErrInvalidJob)
+	return q.DeleteBatch(ctx, []string{id})
+}
+
+func (q *DelayQueue) DeleteBatch(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
+		return nil
 	}
-	now := time.Now().UTC()
+
+	uniqueIDs := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			return fmt.Errorf("%w: empty id", ErrInvalidJob)
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		uniqueIDs = append(uniqueIDs, id)
+	}
+
+	now := nowTimestamp()
 	query := fmt.Sprintf(`
 UPDATE %s
-SET status = $1, updated_at = $2
-WHERE queue = $3 AND id = $4 AND status = $5`, q.fullTableName())
-	if _, err := q.pg.Exec(ctx, query, statusCancelled, now, q.opts.queue, id, statusPending); err != nil {
+SET status = $1, updated_at = $2, lease_until = NULL
+WHERE queue = $3 AND id = ANY($4::text[]) AND status = $5`, q.fullTableName())
+	if _, err := q.pg.Exec(ctx, query, statusCancelled, now, q.opts.queue, uniqueIDs, statusPending); err != nil {
 		return err
 	}
-	return q.removeIDsFromRedis(ctx, q.shard(id), []string{id})
+
+	idsByShard := make(map[int][]string, len(uniqueIDs))
+	for _, id := range uniqueIDs {
+		shard := q.shard(id)
+		idsByShard[shard] = append(idsByShard[shard], id)
+	}
+
+	for shard, shardIDs := range idsByShard {
+		if err := q.removeIDsFromRedis(ctx, shard, shardIDs); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (q *DelayQueue) promoteLoop(ctx context.Context) {
@@ -652,7 +702,7 @@ func (q *DelayQueue) promoteUntilDrained(ctx context.Context) {
 }
 
 func (q *DelayQueue) promoteOnce(ctx context.Context) (int, error) {
-	now := time.Now().UTC()
+	now := nowTimestamp()
 	horizon := now.Add(q.opts.hotWindow)
 	cutoff := now.Add(-q.opts.retention)
 	refreshBefore := now.Add(-q.opts.promoteRefreshInterval)
@@ -670,11 +720,12 @@ WHERE queue = $1
   AND status = $2
   AND run_at <= $3
   AND run_at >= $4
-  AND (promoted_at IS NULL OR promoted_at < $5)
+  AND (lease_until IS NULL OR lease_until < $5)
+  AND (promoted_at IS NULL OR promoted_at < $6)
 ORDER BY run_at
-LIMIT $6
+LIMIT $7
 FOR UPDATE SKIP LOCKED`, q.fullTableName())
-	rows, err := tx.Query(ctx, query, q.opts.queue, statusPending, horizon, cutoff, refreshBefore, q.opts.batchSize)
+	rows, err := tx.Query(ctx, query, q.opts.queue, statusPending, horizon, cutoff, now, refreshBefore, q.opts.batchSize)
 	if err != nil {
 		return 0, err
 	}
@@ -702,68 +753,141 @@ FOR UPDATE SKIP LOCKED`, q.fullTableName())
 		return 0, err
 	}
 
-	updateSQL := fmt.Sprintf(`
-UPDATE %s
-SET promoted_at = $1, updated_at = $1
-WHERE queue = $2 AND id = $3 AND run_at = $4 AND status = $5`, q.fullTableName())
+	ids := make([]string, 0, len(jobs))
+	runAts := make([]time.Time, 0, len(jobs))
 	for _, job := range jobs {
-		if _, err := tx.Exec(ctx, updateSQL, now, q.opts.queue, job.ID, job.RunAt, statusPending); err != nil {
-			return 0, err
-		}
+		ids = append(ids, job.ID)
+		runAts = append(runAts, normalizeTimestamp(job.RunAt))
+	}
+
+	updateSQL := fmt.Sprintf(`
+WITH candidate(id, run_at) AS (
+	SELECT * FROM unnest($3::text[], $4::timestamptz[])
+)
+UPDATE %s t
+SET promoted_at = $1, updated_at = $1
+FROM candidate c
+WHERE t.queue = $2
+  AND t.id = c.id
+  AND t.run_at = c.run_at
+  AND t.status = $5
+RETURNING t.id`, q.fullTableName())
+	updatedRows, err := tx.Query(ctx, updateSQL, now, q.opts.queue, ids, runAts, statusPending)
+	if err != nil {
+		return 0, err
+	}
+	defer updatedRows.Close()
+
+	updated := 0
+	for updatedRows.Next() {
+		updated++
+	}
+	if err := updatedRows.Err(); err != nil {
+		return 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
 
-	return len(jobs), nil
+	return updated, nil
 }
 
-func (q *DelayQueue) pollLoop(ctx context.Context, handlerCtx context.Context, shard int) {
-	q.pollUntilDrained(ctx, handlerCtx, shard)
-
-	ticker := time.NewTicker(q.opts.pollingInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			q.pollUntilDrained(ctx, handlerCtx, shard)
-		}
-	}
+func (q *DelayQueue) nextShardStart() int {
+	return int(q.shardSeq.Add(1)-1) % q.opts.shardNum
 }
 
-func (q *DelayQueue) pollUntilDrained(ctx context.Context, handlerCtx context.Context, shard int) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
+func (q *DelayQueue) pollOneBatch(ctx context.Context) (wrappedJobs, bool) {
+	start := q.nextShardStart()
+	for i := range q.opts.shardNum {
+		shard := (start + i) % q.opts.shardNum
 		jobs, err := q.pollRedis(ctx, shard)
 		if err != nil {
 			if !errors.Is(err, redis.Nil) {
 				contextx.Logger(ctx).Warn("[DelayQueue] poll redis failed", "err", err, "queue", q.opts.queue, "shard", shard)
 			}
-			return
+			continue
 		}
 		if len(jobs) == 0 {
-			return
+			continue
 		}
-
-		select {
-		case q.queueCh <- wrappedJobs{ctx: handlerCtx, shard: shard, jobs: jobs}:
-		case <-ctx.Done():
-			return
-		default:
-			if err := q.requeueJobsToRedis(ctx, shard, jobs); err != nil {
-				contextx.Logger(ctx).Warn("[DelayQueue] requeue claimed jobs failed", "err", err, "queue", q.opts.queue, "shard", shard)
-			}
-			return
-		}
-
-		if len(jobs) < q.opts.batchSize {
-			return
-		}
+		return wrappedJobs{ctx: ctx, shard: shard, jobs: jobs}, true
 	}
+
+	return wrappedJobs{}, false
+}
+
+func (q *DelayQueue) claimJobs(ctx context.Context, jobs []Job) ([]Job, []string, time.Time, error) {
+	if len(jobs) == 0 {
+		return nil, nil, time.Time{}, nil
+	}
+	if q.pg == nil {
+		return jobs, nil, time.Time{}, nil
+	}
+
+	now := nowTimestamp()
+	leaseUntil := normalizeTimestamp(now.Add(q.opts.leaseTimeout))
+	ids := make([]string, len(jobs))
+	runAts := make([]time.Time, len(jobs))
+	for i, job := range jobs {
+		ids[i] = job.ID
+		runAts[i] = normalizeTimestamp(job.RunAt)
+	}
+
+	query := fmt.Sprintf(`
+WITH candidate(id, run_at) AS (
+	SELECT * FROM unnest($1::text[], $2::timestamptz[])
+)
+UPDATE %s t
+SET lease_until = $3, updated_at = $4, attempts = t.attempts + 1
+FROM candidate c
+WHERE t.queue = $5
+  AND t.id = c.id
+  AND t.run_at = c.run_at
+  AND t.status = $6
+  AND (t.lease_until IS NULL OR t.lease_until < $4)
+RETURNING t.id, t.run_at, t.payload`, q.fullTableName())
+
+	rows, err := q.pg.Query(ctx, query, ids, runAts, leaseUntil, now, q.opts.queue, statusPending)
+	if err != nil {
+		return nil, nil, time.Time{}, err
+	}
+	defer rows.Close()
+
+	claimed := make([]Job, 0, len(jobs))
+	claimedSet := make(map[string]struct{}, len(jobs))
+	jobIdentityKey := func(id string, runAt time.Time) string {
+		return id + "/" + strconv.FormatInt(normalizeTimestamp(runAt).UnixMilli(), 10)
+	}
+	for rows.Next() {
+		var job Job
+		if err := rows.Scan(&job.ID, &job.RunAt, &job.Payload); err != nil {
+			return nil, nil, time.Time{}, err
+		}
+		claimed = append(claimed, job)
+		claimedSet[jobIdentityKey(job.ID, job.RunAt)] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, time.Time{}, err
+	}
+
+	if len(claimed) == len(jobs) {
+		return claimed, nil, leaseUntil, nil
+	}
+
+	residualJobs := make([]Job, 0, len(jobs)-len(claimed))
+	for _, job := range jobs {
+		if _, ok := claimedSet[jobIdentityKey(job.ID, job.RunAt)]; ok {
+			continue
+		}
+		residualJobs = append(residualJobs, job)
+	}
+
+	invalidIDs, err := q.findInvalidJobs(ctx, residualJobs)
+	if err != nil {
+		return nil, nil, time.Time{}, err
+	}
+
+	return claimed, invalidIDs, leaseUntil, nil
 }
 
 func (q *DelayQueue) workerLoop(ctx context.Context, handler Handler) {
@@ -771,18 +895,48 @@ func (q *DelayQueue) workerLoop(ctx context.Context, handler Handler) {
 		if ctx.Err() != nil || q.closed.Load() {
 			return
 		}
-		select {
-		case <-ctx.Done():
-			return
-		case msg := <-q.queueCh:
-			q.execMu.RLock()
-			if ctx.Err() != nil || q.closed.Load() {
-				q.execMu.RUnlock()
+
+		msg, ok := q.pollOneBatch(ctx)
+		if !ok {
+			select {
+			case <-ctx.Done():
 				return
+			case <-time.After(q.opts.pollingInterval):
+				continue
 			}
-			q.processJobs(msg, handler)
-			q.execMu.RUnlock()
 		}
+
+		claimedJobs, invalidIDs, leaseUntil, err := q.claimJobs(ctx, msg.jobs)
+		if err != nil {
+			contextx.Logger(ctx).Warn("[DelayQueue] claim jobs failed", "err", err, "queue", q.opts.queue, "shard", msg.shard)
+			if requeueErr := q.requeueJobsToRedis(ctx, msg.shard, msg.jobs); requeueErr != nil {
+				contextx.Logger(ctx).Warn("[DelayQueue] requeue after claim failure failed", "err", requeueErr, "queue", q.opts.queue, "shard", msg.shard)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(q.opts.pollingInterval):
+				continue
+			}
+		}
+		if len(invalidIDs) > 0 {
+			if err := q.removeIDsFromRedis(ctx, msg.shard, invalidIDs); err != nil {
+				contextx.Logger(ctx).Warn("[DelayQueue] cleanup invalid claimed jobs failed", "err", err, "queue", q.opts.queue, "shard", msg.shard)
+			}
+		}
+		if len(claimedJobs) == 0 {
+			continue
+		}
+		msg.jobs = claimedJobs
+		msg.leaseUntil = leaseUntil
+
+		q.execMu.RLock()
+		if ctx.Err() != nil || q.closed.Load() {
+			q.execMu.RUnlock()
+			return
+		}
+		q.processJobs(msg, handler)
+		q.execMu.RUnlock()
 	}
 }
 
@@ -797,44 +951,64 @@ func (q *DelayQueue) processJobs(msg wrappedJobs, handler Handler) {
 	if len(ackIDs) == 0 {
 		return
 	}
-	if err := q.ackJobs(msg.ctx, msg.shard, msg.jobs, ackIDs); err != nil {
+	if err := q.ackJobs(msg.ctx, msg.shard, msg.jobs, ackIDs, msg.leaseUntil); err != nil {
 		contextx.Logger(msg.ctx).Error("[DelayQueue] ack failed", "err", err, "queue", q.opts.queue, "shard", msg.shard)
 	}
 }
 
-func (q *DelayQueue) ackJobs(ctx context.Context, shard int, jobs []Job, ackIDs []string) error {
+func (q *DelayQueue) ackJobs(ctx context.Context, shard int, jobs []Job, ackIDs []string, leaseUntil time.Time) error {
 	jobByID := make(map[string]Job, len(jobs))
 	for _, job := range jobs {
 		jobByID[job.ID] = job
 	}
 
-	tx, err := q.pg.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-
-	now := time.Now().UTC()
-	updateSQL := fmt.Sprintf(`
-UPDATE %s
-SET status = $1, updated_at = $2
-WHERE queue = $3 AND id = $4 AND run_at = $5 AND status = $6`, q.fullTableName())
-
-	cleanupIDs := make([]string, 0, len(ackIDs))
+	now := nowTimestamp()
+	ids := make([]string, 0, len(ackIDs))
+	runAts := make([]time.Time, 0, len(ackIDs))
 	for _, id := range ackIDs {
 		job, ok := jobByID[id]
 		if !ok {
 			continue
 		}
-		if _, err := tx.Exec(ctx, updateSQL, statusSucceeded, now, q.opts.queue, id, job.RunAt, statusPending); err != nil {
+		ids = append(ids, id)
+		runAts = append(runAts, normalizeTimestamp(job.RunAt))
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	updateSQL := fmt.Sprintf(`
+WITH candidate(id, run_at) AS (
+	SELECT * FROM unnest($4::text[], $5::timestamptz[])
+)
+UPDATE %s t
+SET status = $1, updated_at = $2, lease_until = NULL
+FROM candidate c
+WHERE t.queue = $3
+  AND t.id = c.id
+  AND t.run_at = c.run_at
+  AND t.status = $6
+  AND t.lease_until = $7
+RETURNING t.id`, q.fullTableName())
+
+	rows, err := q.pg.Query(ctx, updateSQL, statusSucceeded, now, q.opts.queue, ids, runAts, statusPending, normalizeTimestamp(leaseUntil))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	cleanupIDs := make([]string, 0, len(ids))
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
 			return err
 		}
 		cleanupIDs = append(cleanupIDs, id)
 	}
-
-	if err := tx.Commit(ctx); err != nil {
+	if err := rows.Err(); err != nil {
 		return err
 	}
+
 	return q.removeIDsFromRedis(ctx, shard, cleanupIDs)
 }
 
@@ -879,7 +1053,7 @@ func (q *DelayQueue) addJobsToRedis(ctx context.Context, jobs []Job) error {
 		}
 		env, err := sonic.MarshalString(redisJobEnvelope{
 			ID:      job.ID,
-			RunAt:   job.RunAt.UnixMilli(),
+			RunAt:   normalizeTimestamp(job.RunAt).UnixMilli(),
 			Payload: job.Payload,
 		})
 		if err != nil {
@@ -890,7 +1064,7 @@ func (q *DelayQueue) addJobsToRedis(ctx context.Context, jobs []Job) error {
 		addJobScript.Eval(ctx, pl, []string{
 			q.readyKey(shard),
 			q.payloadKey(shard, job.ID),
-		}, job.ID, job.RunAt.UnixMilli(), env, ttl.Milliseconds())
+		}, job.ID, normalizeTimestamp(job.RunAt).UnixMilli(), env, ttl.Milliseconds())
 	}
 	_, err := pl.Exec(ctx)
 	return err
@@ -912,7 +1086,7 @@ return values
 `)
 
 func (q *DelayQueue) pollRedis(ctx context.Context, shard int) ([]Job, error) {
-	now := time.Now()
+	now := nowTimestamp()
 	ids, err := pollJobsScript.Run(ctx, q.rdb, []string{
 		q.readyKey(shard),
 		q.pendingKey(shard),
@@ -958,7 +1132,7 @@ func (q *DelayQueue) pollRedis(ctx context.Context, shard int) ([]Job, error) {
 			continue
 		}
 
-		runAt := time.UnixMilli(env.RunAt).UTC()
+		runAt := normalizeTimestamp(time.UnixMilli(env.RunAt))
 		if now.After(runAt.Add(q.opts.retention)) {
 			expired = append(expired, ids[i])
 			continue
@@ -970,16 +1144,6 @@ func (q *DelayQueue) pollRedis(ctx context.Context, shard int) ([]Job, error) {
 			Payload: env.Payload,
 		})
 	}
-
-	// jobs, stale, err := q.filterPendingJobs(ctx, jobs)
-	// if err != nil {
-	// 	return nil, err
-	// }
-	// if len(stale) > 0 {
-	// 	if err := q.removeIDsFromRedis(ctx, shard, stale); err != nil {
-	// 		contextx.Logger(ctx).Warn("[DelayQueue] cleanup stale redis jobs failed", "err", err, "queue", q.opts.queue, "shard", shard)
-	// 	}
-	// }
 
 	if len(missing) > 0 {
 		if err := q.removeIDsFromRedis(ctx, shard, missing); err != nil {
@@ -1054,7 +1218,7 @@ func (q *DelayQueue) reclaimOnce(ctx context.Context, shard int) {
 	err := reclaimJobsScript.Run(ctx, q.rdb, []string{
 		q.pendingKey(shard),
 		q.readyKey(shard),
-	}, q.opts.batchSize, time.Now().UnixMilli()).Err()
+	}, q.opts.batchSize, nowTimestamp().UnixMilli()).Err()
 	if err != nil && !errors.Is(err, redis.Nil) {
 		contextx.Logger(ctx).Warn("[DelayQueue] reclaim failed", "err", err, "queue", q.opts.queue, "shard", shard)
 	}
@@ -1067,7 +1231,7 @@ func (q *DelayQueue) requeueJobsToRedis(ctx context.Context, shard int, jobs []J
 
 	args := make([]any, 0, len(jobs)*2)
 	for _, job := range jobs {
-		args = append(args, job.ID, job.RunAt.UnixMilli())
+		args = append(args, job.ID, normalizeTimestamp(job.RunAt).UnixMilli())
 	}
 
 	return requeueJobsScript.Run(ctx, q.rdb, []string{
@@ -1076,63 +1240,52 @@ func (q *DelayQueue) requeueJobsToRedis(ctx context.Context, shard int, jobs []J
 	}, args...).Err()
 }
 
-func (q *DelayQueue) filterPendingJobs(ctx context.Context, jobs []Job) ([]Job, []string, error) {
+func (q *DelayQueue) findInvalidJobs(ctx context.Context, jobs []Job) ([]string, error) {
 	if len(jobs) == 0 {
-		return nil, nil, nil
+		return nil, nil
 	}
 	if q.pg == nil {
-		return jobs, nil, nil
+		return nil, nil
 	}
 
 	ids := make([]string, len(jobs))
 	runAts := make([]time.Time, len(jobs))
 	for i, job := range jobs {
 		ids[i] = job.ID
-		runAts[i] = job.RunAt.UTC()
+		runAts[i] = normalizeTimestamp(job.RunAt)
 	}
 
 	query := fmt.Sprintf(`
 WITH candidate(id, run_at) AS (
 	SELECT * FROM unnest($2::text[], $3::timestamptz[])
 )
-SELECT c.id, c.run_at
+SELECT c.id
 FROM candidate c
-JOIN %s t
+LEFT JOIN %s t
   ON t.queue = $1
  AND t.id = c.id
  AND t.run_at = c.run_at
- AND t.status = $4`, q.fullTableName())
+WHERE t.id IS NULL OR t.status <> $4`, q.fullTableName())
 
 	rows, err := q.pg.Query(ctx, query, q.opts.queue, ids, runAts, statusPending)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer rows.Close()
 
-	pending := make(map[jobIdentity]struct{}, len(jobs))
+	invalidIDs := make([]string, 0, len(jobs))
 	for rows.Next() {
 		var id string
-		var runAt time.Time
-		if err := rows.Scan(&id, &runAt); err != nil {
-			return nil, nil, err
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
 		}
-		pending[jobIdentity{ID: id, RunAt: runAt.UTC()}] = struct{}{}
+		invalidIDs = append(invalidIDs, id)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	filtered := make([]Job, 0, len(jobs))
-	stale := make([]string, 0)
-	for _, job := range jobs {
-		if _, ok := pending[jobIdentity{ID: job.ID, RunAt: job.RunAt.UTC()}]; ok {
-			filtered = append(filtered, job)
-			continue
-		}
-		stale = append(stale, job.ID)
-	}
-
-	return filtered, stale, nil
+	return invalidIDs, nil
 }
 
 func (q *DelayQueue) shard(id string) int {

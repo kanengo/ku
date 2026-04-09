@@ -82,7 +82,7 @@ func (f *fakeCmdable) Eval(ctx context.Context, script string, keys []string, ar
 	switch script {
 	case pollJobsScriptSrc:
 		cmd.SetVal(f.pollIDs)
-	case removeIDsScriptSrc, reclaimJobsScriptSrc:
+	case removeIDsScriptSource, reclaimJobsScriptSource, requeueJobsScriptSource:
 		cmd.SetVal(int64(len(args)))
 	default:
 		cmd.SetVal(int64(1))
@@ -115,27 +115,6 @@ for _, id in ipairs(values) do
 	redis.call("ZADD", KEYS[2], leaseUntil, id)
 end
 return values
-`
-	removeIDsScriptSrc = `
-for i, id in ipairs(ARGV) do
-	redis.call("ZREM", KEYS[1], id)
-	redis.call("ZREM", KEYS[2], id)
-	redis.call("DEL", KEYS[i + 2])
-end
-return #ARGV
-`
-	reclaimJobsScriptSrc = `
-local batchSize = tonumber(ARGV[1])
-local now = ARGV[2]
-local values = redis.call("ZRANGE", KEYS[1], "-inf", now, "BYSCORE", "LIMIT", 0, batchSize)
-if #values == 0 then
-	return 0
-end
-redis.call("ZREM", KEYS[1], unpack(values))
-for _, id in ipairs(values) do
-	redis.call("ZADD", KEYS[2], now, id)
-end
-return #values
 `
 )
 
@@ -478,4 +457,34 @@ func TestPollRedisFiltersInvalidPayloadsAndCleansUp(t *testing.T) {
 	assert.True(t, strings.Contains(rdb.scriptRuns[0].script, `redis.call("ZRANGE", KEYS[1], "-inf", now, "BYSCORE"`))
 	assert.Equal(t, []interface{}{"missing", "bad-type", "bad-json"}, rdb.scriptRuns[1].args)
 	assert.Equal(t, []interface{}{"expired"}, rdb.scriptRuns[2].args)
+}
+
+func TestPollUntilDrainedRequeuesWhenQueueIsFull(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rdb := &fakeCmdable{
+		pollIDs: []interface{}{"job-1"},
+	}
+	runAt := time.Now().UTC().Truncate(time.Millisecond)
+	payload, err := sonic.MarshalString(redisJobEnvelope{
+		ID:      "job-1",
+		RunAt:   runAt.UnixMilli(),
+		Payload: []byte("payload"),
+	})
+	require.NoError(t, err)
+	rdb.mgetValues = []interface{}{payload}
+
+	q := newTestQueue()
+	q.rdb = rdb
+	q.queueCh = make(chan wrappedJobs, 1)
+	q.queueCh <- wrappedJobs{ctx: ctx, shard: 0, jobs: []Job{{ID: "occupied", RunAt: time.Now()}}}
+
+	q.pollUntilDrained(ctx, ctx, q.shard("job-1"))
+
+	require.Len(t, rdb.scriptRuns, 2)
+	assert.True(t, strings.Contains(rdb.scriptRuns[0].script, `redis.call("ZRANGE", KEYS[1], "-inf", now, "BYSCORE"`))
+	assert.Equal(t, requeueJobsScriptSource, rdb.scriptRuns[1].script)
+	assert.Equal(t, []interface{}{"job-1", runAt.UnixMilli()}, rdb.scriptRuns[1].args)
+	assert.Len(t, q.queueCh, 1)
 }

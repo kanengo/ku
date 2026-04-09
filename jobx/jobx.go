@@ -280,6 +280,11 @@ type redisJobEnvelope struct {
 	Payload []byte `json:"payload"`
 }
 
+type jobIdentity struct {
+	ID    string
+	RunAt time.Time
+}
+
 func NewDelayQueue(ctx context.Context, dsn string, rdb redis.Cmdable, opts ...Option) (*DelayQueue, error) {
 	if dsn == "" {
 		return nil, ErrNilPostgres
@@ -533,7 +538,7 @@ func (q *DelayQueue) Start(ctx context.Context, handler Handler) error {
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
-	handlerCtx := ctx
+	handlerCtx := runCtx
 	q.startMu.Lock()
 	q.runCancel = cancel
 	q.startMu.Unlock()
@@ -748,6 +753,11 @@ func (q *DelayQueue) pollUntilDrained(ctx context.Context, handlerCtx context.Co
 		case q.queueCh <- wrappedJobs{ctx: handlerCtx, shard: shard, jobs: jobs}:
 		case <-ctx.Done():
 			return
+		default:
+			if err := q.requeueJobsToRedis(ctx, shard, jobs); err != nil {
+				contextx.Logger(ctx).Warn("[DelayQueue] requeue claimed jobs failed", "err", err, "queue", q.opts.queue, "shard", shard)
+			}
+			return
 		}
 
 		if len(jobs) < q.opts.batchSize {
@@ -843,7 +853,7 @@ func (q *DelayQueue) reclaimLoop(ctx context.Context, shard int) {
 	}
 }
 
-var addJobScript = redis.NewScript(`
+const addJobScriptSource = `
 local ttl = tonumber(ARGV[4])
 if ttl <= 0 then
 	return 0
@@ -851,7 +861,9 @@ end
 redis.call("SET", KEYS[2], ARGV[3], "PX", ttl)
 redis.call("ZADD", KEYS[1], ARGV[2], ARGV[1])
 return 1
-`)
+`
+
+var addJobScript = redis.NewScript(addJobScriptSource)
 
 func (q *DelayQueue) addJobsToRedis(ctx context.Context, jobs []Job) error {
 	if len(jobs) == 0 {
@@ -874,7 +886,8 @@ func (q *DelayQueue) addJobsToRedis(ctx context.Context, jobs []Job) error {
 			return err
 		}
 		shard := q.shard(job.ID)
-		addJobScript.Run(ctx, pl, []string{
+		// Pipeline does not transparently recover from NOSCRIPT, so use EVAL directly here.
+		addJobScript.Eval(ctx, pl, []string{
 			q.readyKey(shard),
 			q.payloadKey(shard, job.ID),
 		}, job.ID, job.RunAt.UnixMilli(), env, ttl.Milliseconds())
@@ -940,6 +953,10 @@ func (q *DelayQueue) pollRedis(ctx context.Context, shard int) ([]Job, error) {
 			missing = append(missing, ids[i])
 			continue
 		}
+		if env.ID != ids[i] {
+			missing = append(missing, ids[i])
+			continue
+		}
 
 		runAt := time.UnixMilli(env.RunAt).UTC()
 		if now.After(runAt.Add(q.opts.retention)) {
@@ -953,6 +970,16 @@ func (q *DelayQueue) pollRedis(ctx context.Context, shard int) ([]Job, error) {
 			Payload: env.Payload,
 		})
 	}
+
+	// jobs, stale, err := q.filterPendingJobs(ctx, jobs)
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// if len(stale) > 0 {
+	// 	if err := q.removeIDsFromRedis(ctx, shard, stale); err != nil {
+	// 		contextx.Logger(ctx).Warn("[DelayQueue] cleanup stale redis jobs failed", "err", err, "queue", q.opts.queue, "shard", shard)
+	// 	}
+	// }
 
 	if len(missing) > 0 {
 		if err := q.removeIDsFromRedis(ctx, shard, missing); err != nil {
@@ -968,14 +995,16 @@ func (q *DelayQueue) pollRedis(ctx context.Context, shard int) ([]Job, error) {
 	return jobs, nil
 }
 
-var removeIDsScript = redis.NewScript(`
+const removeIDsScriptSource = `
 for i, id in ipairs(ARGV) do
 	redis.call("ZREM", KEYS[1], id)
 	redis.call("ZREM", KEYS[2], id)
 	redis.call("DEL", KEYS[i + 2])
 end
 return #ARGV
-`)
+`
+
+var removeIDsScript = redis.NewScript(removeIDsScriptSource)
 
 func (q *DelayQueue) removeIDsFromRedis(ctx context.Context, shard int, ids []string) error {
 	if len(ids) == 0 {
@@ -993,7 +1022,7 @@ func (q *DelayQueue) removeIDsFromRedis(ctx context.Context, shard int, ids []st
 	return removeIDsScript.Run(ctx, q.rdb, keys, args...).Err()
 }
 
-var reclaimJobsScript = redis.NewScript(`
+const reclaimJobsScriptSource = `
 local batchSize = tonumber(ARGV[1])
 local now = ARGV[2]
 local values = redis.call("ZRANGE", KEYS[1], "-inf", now, "BYSCORE", "LIMIT", 0, batchSize)
@@ -1005,7 +1034,21 @@ for _, id in ipairs(values) do
 	redis.call("ZADD", KEYS[2], now, id)
 end
 return #values
-`)
+`
+
+var reclaimJobsScript = redis.NewScript(reclaimJobsScriptSource)
+
+const requeueJobsScriptSource = `
+for i = 1, #ARGV, 2 do
+	local id = ARGV[i]
+	local score = ARGV[i + 1]
+	redis.call("ZREM", KEYS[1], id)
+	redis.call("ZADD", KEYS[2], score, id)
+end
+return #ARGV / 2
+`
+
+var requeueJobsScript = redis.NewScript(requeueJobsScriptSource)
 
 func (q *DelayQueue) reclaimOnce(ctx context.Context, shard int) {
 	err := reclaimJobsScript.Run(ctx, q.rdb, []string{
@@ -1015,6 +1058,81 @@ func (q *DelayQueue) reclaimOnce(ctx context.Context, shard int) {
 	if err != nil && !errors.Is(err, redis.Nil) {
 		contextx.Logger(ctx).Warn("[DelayQueue] reclaim failed", "err", err, "queue", q.opts.queue, "shard", shard)
 	}
+}
+
+func (q *DelayQueue) requeueJobsToRedis(ctx context.Context, shard int, jobs []Job) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+
+	args := make([]any, 0, len(jobs)*2)
+	for _, job := range jobs {
+		args = append(args, job.ID, job.RunAt.UnixMilli())
+	}
+
+	return requeueJobsScript.Run(ctx, q.rdb, []string{
+		q.pendingKey(shard),
+		q.readyKey(shard),
+	}, args...).Err()
+}
+
+func (q *DelayQueue) filterPendingJobs(ctx context.Context, jobs []Job) ([]Job, []string, error) {
+	if len(jobs) == 0 {
+		return nil, nil, nil
+	}
+	if q.pg == nil {
+		return jobs, nil, nil
+	}
+
+	ids := make([]string, len(jobs))
+	runAts := make([]time.Time, len(jobs))
+	for i, job := range jobs {
+		ids[i] = job.ID
+		runAts[i] = job.RunAt.UTC()
+	}
+
+	query := fmt.Sprintf(`
+WITH candidate(id, run_at) AS (
+	SELECT * FROM unnest($2::text[], $3::timestamptz[])
+)
+SELECT c.id, c.run_at
+FROM candidate c
+JOIN %s t
+  ON t.queue = $1
+ AND t.id = c.id
+ AND t.run_at = c.run_at
+ AND t.status = $4`, q.fullTableName())
+
+	rows, err := q.pg.Query(ctx, query, q.opts.queue, ids, runAts, statusPending)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+
+	pending := make(map[jobIdentity]struct{}, len(jobs))
+	for rows.Next() {
+		var id string
+		var runAt time.Time
+		if err := rows.Scan(&id, &runAt); err != nil {
+			return nil, nil, err
+		}
+		pending[jobIdentity{ID: id, RunAt: runAt.UTC()}] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	filtered := make([]Job, 0, len(jobs))
+	stale := make([]string, 0)
+	for _, job := range jobs {
+		if _, ok := pending[jobIdentity{ID: job.ID, RunAt: job.RunAt.UTC()}]; ok {
+			filtered = append(filtered, job)
+			continue
+		}
+		stale = append(stale, job.ID)
+	}
+
+	return filtered, stale, nil
 }
 
 func (q *DelayQueue) shard(id string) int {

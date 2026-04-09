@@ -59,6 +59,7 @@ type fakeCmdable struct {
 	pollIDs    []interface{}
 	mgetValues []interface{}
 	mgetErr    error
+	evalHook   func(context.Context, string, []string, ...interface{}) error
 }
 
 func (f *fakeCmdable) Pipeline() redis.Pipeliner {
@@ -78,6 +79,13 @@ func (f *fakeCmdable) Eval(ctx context.Context, script string, keys []string, ar
 		args:   append([]interface{}(nil), args...),
 	})
 	cmd := redis.NewCmd(ctx)
+
+	if f.evalHook != nil {
+		if err := f.evalHook(ctx, script, keys, args...); err != nil {
+			cmd.SetErr(err)
+			return cmd
+		}
+	}
 
 	switch script {
 	case pollJobsScriptSrc:
@@ -398,6 +406,92 @@ func TestProcessJobsAndWorkerLoop(t *testing.T) {
 			t.Fatal("workerLoop did not process queued jobs")
 		}
 	})
+
+	t.Run("shutdown waits for in-flight handler", func(t *testing.T) {
+		q := newTestQueue()
+		runAt := time.Now().UTC().Truncate(time.Millisecond)
+		payload, err := sonic.MarshalString(redisJobEnvelope{
+			ID:      "job-1",
+			RunAt:   runAt.UnixMilli(),
+			Payload: []byte("payload"),
+		})
+		require.NoError(t, err)
+
+		q.rdb = &fakeCmdable{
+			pollIDs:    []interface{}{"job-1"},
+			mgetValues: []interface{}{payload},
+		}
+
+		runCtx, cancel := context.WithCancel(context.Background())
+		q.started.Store(true)
+		q.runCancel = cancel
+
+		handlerStarted := make(chan struct{})
+		releaseHandler := make(chan struct{})
+		q.wg.Add(1)
+		go func() {
+			defer q.wg.Done()
+			q.workerLoop(runCtx, func(_ context.Context, jobs []Job) []string {
+				close(handlerStarted)
+				<-releaseHandler
+				return nil
+			})
+		}()
+
+		select {
+		case <-handlerStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("handler did not start")
+		}
+
+		shutdownDone := make(chan error, 1)
+		go func() {
+			shutdownDone <- q.Shutdown()
+		}()
+
+		select {
+		case err := <-shutdownDone:
+			t.Fatalf("shutdown returned before handler completed: %v", err)
+		case <-time.After(150 * time.Millisecond):
+		}
+
+		close(releaseHandler)
+
+		select {
+		case err := <-shutdownDone:
+			require.NoError(t, err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("shutdown did not wait for handler completion")
+		}
+	})
+}
+
+func TestRequeueJobsToRedisBestEffort(t *testing.T) {
+	q := newTestQueue()
+	var attempts int
+	rdb := &fakeCmdable{
+		evalHook: func(ctx context.Context, script string, _ []string, _ ...interface{}) error {
+			if script != requeueJobsScriptSource {
+				return nil
+			}
+			attempts++
+			if attempts == 1 {
+				return context.Canceled
+			}
+			return nil
+		},
+	}
+	q.rdb = rdb
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := q.requeueJobsToRedisBestEffort(canceledCtx, 1, []Job{{ID: "job-1", RunAt: time.UnixMilli(1234).UTC()}})
+	require.NoError(t, err)
+	require.Len(t, rdb.scriptRuns, 2)
+	assert.Equal(t, requeueJobsScriptSource, rdb.scriptRuns[0].script)
+	assert.Equal(t, requeueJobsScriptSource, rdb.scriptRuns[1].script)
+	assert.Equal(t, 2, attempts)
 }
 
 func TestAddJobsToRedisSkipsExpiredJobs(t *testing.T) {

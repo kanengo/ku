@@ -3,6 +3,7 @@ package jobx
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -19,16 +20,20 @@ import (
 
 func TestDelayQueue_Integration(t *testing.T) {
 	const (
-		defaultPGDSN          = ""
-		defaultRedisAddr      = ""
-		defaultRedisPassword  = ""
-		defaultRedisDB        = "15"
+		defaultPGDSN          = "host=43.133.32.63 user=soular password=CDdyJmCQ0r0YdBYZ6EWB dbname=soular port=6432 sslmode=disable"
+		defaultRedisAddr      = "43.133.32.63:6379"
+		defaultRedisPassword  = "NxAAj9edpp3J6zJN7xG6"
+		defaultRedisDB        = "1"
 		defaultTestTimeout    = 45 * time.Second
 		defaultLeaseTimeout   = 400 * time.Millisecond
 		defaultPolling        = 80 * time.Millisecond
 		defaultPromote        = 80 * time.Millisecond
 		defaultPromoteRefresh = 150 * time.Millisecond
 	)
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		AddSource: true,
+	}))
+	slog.SetDefault(logger)
 
 	pgDSN := strings.TrimSpace(os.Getenv("TEST_PG_DSN"))
 	if pgDSN == "" {
@@ -71,7 +76,7 @@ func TestDelayQueue_Integration(t *testing.T) {
 	}
 	defer rdb.Close()
 
-	schema := fmt.Sprintf("jobx_it_%d", time.Now().Unix())
+	schema := "infra"
 	table := fmt.Sprintf("delay_jobs_it_%d", time.Now().UnixNano())
 
 	t.Cleanup(func() {
@@ -96,9 +101,9 @@ func TestDelayQueue_Integration(t *testing.T) {
 		require.NoError(t, err)
 
 		jobs := []Job{
-			{RunAt: time.Now().Add(120 * time.Millisecond), Payload: []byte("job-a")},
-			{RunAt: time.Now().Add(180 * time.Millisecond), Payload: []byte("job-b")},
-			{RunAt: time.Now().Add(240 * time.Millisecond), Payload: []byte("job-c")},
+			{RunAt: time.Now().Add(1000 * time.Millisecond), Payload: []byte("job-a")},
+			{RunAt: time.Now().Add(2000 * time.Millisecond), Payload: []byte("job-b")},
+			{RunAt: time.Now().Add(3000 * time.Millisecond), Payload: []byte("job-c")},
 		}
 		ids, err := q.EnqueueBatch(ctx, jobs)
 		require.NoError(t, err)
@@ -174,13 +179,13 @@ func TestDelayQueue_Integration(t *testing.T) {
 	})
 
 	t.Cleanup(func() {
-		pg := getIntegrationQueueConn(ctx, pgDSN)
+		pg := getIntegrationQueueConn(context.Background(), pgDSN)
 		if pg == nil {
 			t.Log("cleanup drop table skipped: postgres connection unavailable")
 		} else if _, err := pg.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS "%s"."%s"`, schema, table)); err != nil {
 			t.Logf("cleanup drop table failed: %v", err)
 		}
-		cleanupRedisNamespace(ctx, t, rdb, "jobx:{queue_")
+		cleanupRedisNamespace(context.Background(), t, rdb, "jobx:{queue_")
 	})
 }
 

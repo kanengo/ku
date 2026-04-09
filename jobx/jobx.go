@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"log/slog"
 	"math/rand/v2"
 	"regexp"
 	"strconv"
@@ -16,7 +17,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/kanengo/ku/contextx"
 	"github.com/kanengo/ku/distributedx"
 	dsnowflake "github.com/kanengo/ku/distributedx/snowflake"
 	"github.com/redis/go-redis/v9"
@@ -55,6 +55,7 @@ const (
 	defaultShardNum        = 16
 	defaultConcurrency     = 4
 	defaultQueueDepth      = 100
+	defaultShutdownTimeout = 5 * time.Second
 )
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -542,7 +543,7 @@ func (q *DelayQueue) EnqueueBatch(ctx context.Context, jobs []Job) ([]string, er
 		}
 	}
 	if err := q.addJobsToRedis(ctx, hotJobs); err != nil {
-		contextx.Logger(ctx).Warn("[DelayQueue] enqueue redis hot write failed", "err", err, "queue", q.opts.queue)
+		slog.WarnContext(ctx, "[DelayQueue] enqueue redis hot write failed", "err", err, "queue", q.opts.queue)
 	}
 
 	return ids, nil
@@ -595,19 +596,20 @@ func (q *DelayQueue) Shutdown() error {
 
 	q.closed.Store(true)
 
-	q.startMu.Lock()
-	cancel := q.runCancel
-	q.runCancel = nil
-	q.startMu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-
 	q.acceptMu.Lock()
 	q.acceptMu.Unlock()
 
 	if q.started.CompareAndSwap(true, false) {
 		q.execMu.Lock()
+
+		q.startMu.Lock()
+		cancel := q.runCancel
+		q.runCancel = nil
+		q.startMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+
 		q.execMu.Unlock()
 		q.wg.Wait()
 	}
@@ -692,7 +694,10 @@ func (q *DelayQueue) promoteUntilDrained(ctx context.Context) {
 		}
 		n, err := q.promoteOnce(ctx)
 		if err != nil {
-			contextx.Logger(ctx).Warn("[DelayQueue] promote failed", "err", err, "queue", q.opts.queue)
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			slog.WarnContext(ctx, "[DelayQueue] promote failed", "err", err, "queue", q.opts.queue)
 			return
 		}
 		if n < q.opts.batchSize {
@@ -802,8 +807,11 @@ func (q *DelayQueue) pollOneBatch(ctx context.Context) (wrappedJobs, bool) {
 		shard := (start + i) % q.opts.shardNum
 		jobs, err := q.pollRedis(ctx, shard)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return wrappedJobs{}, false
+			}
 			if !errors.Is(err, redis.Nil) {
-				contextx.Logger(ctx).Warn("[DelayQueue] poll redis failed", "err", err, "queue", q.opts.queue, "shard", shard)
+				slog.WarnContext(ctx, "[DelayQueue] poll redis failed", "err", err, "queue", q.opts.queue, "shard", shard)
 			}
 			continue
 		}
@@ -896,8 +904,15 @@ func (q *DelayQueue) workerLoop(ctx context.Context, handler Handler) {
 			return
 		}
 
+		q.execMu.RLock()
+		if ctx.Err() != nil || q.closed.Load() {
+			q.execMu.RUnlock()
+			return
+		}
+
 		msg, ok := q.pollOneBatch(ctx)
 		if !ok {
+			q.execMu.RUnlock()
 			select {
 			case <-ctx.Done():
 				return
@@ -908,10 +923,14 @@ func (q *DelayQueue) workerLoop(ctx context.Context, handler Handler) {
 
 		claimedJobs, invalidIDs, leaseUntil, err := q.claimJobs(ctx, msg.jobs)
 		if err != nil {
-			contextx.Logger(ctx).Warn("[DelayQueue] claim jobs failed", "err", err, "queue", q.opts.queue, "shard", msg.shard)
-			if requeueErr := q.requeueJobsToRedis(ctx, msg.shard, msg.jobs); requeueErr != nil {
-				contextx.Logger(ctx).Warn("[DelayQueue] requeue after claim failure failed", "err", requeueErr, "queue", q.opts.queue, "shard", msg.shard)
+			if requeueErr := q.requeueJobsToRedisBestEffort(ctx, msg.shard, msg.jobs); requeueErr != nil {
+				slog.WarnContext(ctx, "[DelayQueue] requeue after claim failure failed", "err", requeueErr, "queue", q.opts.queue, "shard", msg.shard)
 			}
+			q.execMu.RUnlock()
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+			slog.WarnContext(ctx, "[DelayQueue] claim jobs failed", "err", err, "queue", q.opts.queue, "shard", msg.shard)
 			select {
 			case <-ctx.Done():
 				return
@@ -921,20 +940,16 @@ func (q *DelayQueue) workerLoop(ctx context.Context, handler Handler) {
 		}
 		if len(invalidIDs) > 0 {
 			if err := q.removeIDsFromRedis(ctx, msg.shard, invalidIDs); err != nil {
-				contextx.Logger(ctx).Warn("[DelayQueue] cleanup invalid claimed jobs failed", "err", err, "queue", q.opts.queue, "shard", msg.shard)
+				slog.WarnContext(ctx, "[DelayQueue] cleanup invalid claimed jobs failed", "err", err, "queue", q.opts.queue, "shard", msg.shard)
 			}
 		}
 		if len(claimedJobs) == 0 {
+			q.execMu.RUnlock()
 			continue
 		}
 		msg.jobs = claimedJobs
 		msg.leaseUntil = leaseUntil
 
-		q.execMu.RLock()
-		if ctx.Err() != nil || q.closed.Load() {
-			q.execMu.RUnlock()
-			return
-		}
 		q.processJobs(msg, handler)
 		q.execMu.RUnlock()
 	}
@@ -943,7 +958,7 @@ func (q *DelayQueue) workerLoop(ctx context.Context, handler Handler) {
 func (q *DelayQueue) processJobs(msg wrappedJobs, handler Handler) {
 	defer func() {
 		if r := recover(); r != nil {
-			contextx.Logger(msg.ctx).Error("[DelayQueue] handler panic", "err", r, "queue", q.opts.queue, "shard", msg.shard)
+			slog.ErrorContext(msg.ctx, "[DelayQueue] handler panic", "err", r, "queue", q.opts.queue, "shard", msg.shard)
 		}
 	}()
 
@@ -952,7 +967,7 @@ func (q *DelayQueue) processJobs(msg wrappedJobs, handler Handler) {
 		return
 	}
 	if err := q.ackJobs(msg.ctx, msg.shard, msg.jobs, ackIDs, msg.leaseUntil); err != nil {
-		contextx.Logger(msg.ctx).Error("[DelayQueue] ack failed", "err", err, "queue", q.opts.queue, "shard", msg.shard)
+		slog.ErrorContext(msg.ctx, "[DelayQueue] ack failed", "err", err, "queue", q.opts.queue, "shard", msg.shard)
 	}
 }
 
@@ -1147,12 +1162,12 @@ func (q *DelayQueue) pollRedis(ctx context.Context, shard int) ([]Job, error) {
 
 	if len(missing) > 0 {
 		if err := q.removeIDsFromRedis(ctx, shard, missing); err != nil {
-			contextx.Logger(ctx).Warn("[DelayQueue] cleanup missing redis jobs failed", "err", err, "queue", q.opts.queue, "shard", shard)
+			slog.WarnContext(ctx, "[DelayQueue] cleanup missing redis jobs failed", "err", err, "queue", q.opts.queue, "shard", shard)
 		}
 	}
 	if len(expired) > 0 {
 		if err := q.removeIDsFromRedis(ctx, shard, expired); err != nil {
-			contextx.Logger(ctx).Warn("[DelayQueue] cleanup expired redis jobs failed", "err", err, "queue", q.opts.queue, "shard", shard)
+			slog.WarnContext(ctx, "[DelayQueue] cleanup expired redis jobs failed", "err", err, "queue", q.opts.queue, "shard", shard)
 		}
 	}
 
@@ -1220,7 +1235,10 @@ func (q *DelayQueue) reclaimOnce(ctx context.Context, shard int) {
 		q.readyKey(shard),
 	}, q.opts.batchSize, nowTimestamp().UnixMilli()).Err()
 	if err != nil && !errors.Is(err, redis.Nil) {
-		contextx.Logger(ctx).Warn("[DelayQueue] reclaim failed", "err", err, "queue", q.opts.queue, "shard", shard)
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		slog.WarnContext(ctx, "[DelayQueue] reclaim failed", "err", err, "queue", q.opts.queue, "shard", shard)
 	}
 }
 
@@ -1238,6 +1256,17 @@ func (q *DelayQueue) requeueJobsToRedis(ctx context.Context, shard int, jobs []J
 		q.pendingKey(shard),
 		q.readyKey(shard),
 	}, args...).Err()
+}
+
+func (q *DelayQueue) requeueJobsToRedisBestEffort(ctx context.Context, shard int, jobs []Job) error {
+	err := q.requeueJobsToRedis(ctx, shard, jobs)
+	if err == nil || (!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)) {
+		return err
+	}
+
+	requeueCtx, cancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
+	defer cancel()
+	return q.requeueJobsToRedis(requeueCtx, shard, jobs)
 }
 
 func (q *DelayQueue) findInvalidJobs(ctx context.Context, jobs []Job) ([]string, error) {

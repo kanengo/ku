@@ -1,4 +1,4 @@
-package distributedx
+package conn
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 var PgConn = map[string]*pgxpool.Pool{}
 var connMu sync.Mutex
 
-func GetConn(dsn string) (*pgxpool.Pool, error) {
+func GetPgConn(dsn string) (*pgxpool.Pool, error) {
 	connMu.Lock()
 	defer connMu.Unlock()
 	if conn, ok := PgConn[dsn]; ok {

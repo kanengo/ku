@@ -11,7 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/kanengo/ku/distributedx"
+	"github.com/kanengo/ku/internal/conn"
 	"github.com/kanengo/ku/snowflakex"
 )
 
@@ -62,7 +62,7 @@ func New(ctx context.Context, config Config) (*Snowflake, error) {
 		config.Schema = defaultSchema
 	}
 
-	conn, err := distributedx.GetConn(config.DSN)
+	conn, err := conn.GetPgConn(config.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connection: %w", err)
 	}

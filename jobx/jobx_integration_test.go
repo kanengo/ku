@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/kanengo/ku/distributedx"
+	"github.com/kanengo/ku/internal/conn"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -277,7 +277,7 @@ LIMIT 1`, q.fullTableName()), q.opts.queue, id).Scan(&status)
 }
 
 func getIntegrationQueueConn(ctx context.Context, dsn string) *pgxpool.Pool {
-	pg, err := distributedx.GetConn(dsn)
+	pg, err := conn.GetPgConn(dsn)
 	if err != nil {
 		return nil
 	}

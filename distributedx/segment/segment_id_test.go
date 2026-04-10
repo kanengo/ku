@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/kanengo/ku/distributedx"
+	"github.com/kanengo/ku/internal/conn"
 )
 
 // TestSegmentIDGen_Integration runs an integration test against a PostgreSQL database.
@@ -33,7 +33,7 @@ func TestSegmentIDGen_Integration(t *testing.T) {
 
 	// Clean up table before test to ensure clean state
 	// We need a raw connection for this
-	conn, err := distributedx.GetConn(dsn)
+	conn, err := conn.GetPgConn(dsn)
 	if err == nil {
 		_, _ = conn.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", schema, tableName))
 	}

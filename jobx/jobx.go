@@ -17,8 +17,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/kanengo/ku/distributedx"
 	dsnowflake "github.com/kanengo/ku/distributedx/snowflake"
+	"github.com/kanengo/ku/internal/conn"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -294,7 +294,7 @@ func NewDelayQueue(ctx context.Context, dsn string, rdb redis.Cmdable, opts ...O
 	if rdb == nil {
 		return nil, ErrNilRedis
 	}
-	pg, err := distributedx.GetConn(dsn)
+	pg, err := conn.GetPgConn(dsn)
 	if err != nil {
 		return nil, err
 	}

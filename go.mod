@@ -8,6 +8,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/jackc/pgx/v5 v5.8.0
+	github.com/matoous/go-nanoid/v2 v2.1.0
 	github.com/pjebs/optimus-go v1.0.0
 	github.com/redis/go-redis/v9 v9.16.0
 	github.com/sqids/sqids-go v0.4.1

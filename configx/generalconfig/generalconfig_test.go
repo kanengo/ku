@@ -112,6 +112,54 @@ func TestEntryUpdateRefreshInterval(t *testing.T) {
 	assert.Equal(t, time.Minute, e.interval())
 }
 
+func TestEntryTypedCache(t *testing.T) {
+	type config struct {
+		Name string `json:"name"`
+	}
+
+	e := newEntry("k", time.Minute)
+	e.update(ConfigRecord{Value: `{"name":"first"}`, RefreshInterval: 1}, time.Minute)
+
+	got, err := entryValueAs[config](e)
+	require.NoError(t, err)
+	assert.Equal(t, "first", got.Name)
+
+	typ := typeOf[config]()
+	e.mu.RLock()
+	cached, ok := e.typed[typ]
+	version := e.version
+	e.mu.RUnlock()
+	require.True(t, ok)
+	assert.Equal(t, version, cached.version)
+
+	got, err = entryValueAs[config](e)
+	require.NoError(t, err)
+	assert.Equal(t, "first", got.Name)
+
+	e.update(ConfigRecord{Value: `{"name":"second"}`, RefreshInterval: 1}, time.Minute)
+	got, err = entryValueAs[config](e)
+	require.NoError(t, err)
+	assert.Equal(t, "second", got.Name)
+
+	e.mu.RLock()
+	assert.Greater(t, e.version, version)
+	assert.Len(t, e.typed, 1)
+	e.mu.RUnlock()
+}
+
+func TestEntryTypedCacheNullAny(t *testing.T) {
+	e := newEntry("k", time.Minute)
+	e.update(ConfigRecord{Value: `null`, RefreshInterval: 1}, time.Minute)
+
+	got, err := entryValueAs[any](e)
+	require.NoError(t, err)
+	assert.Nil(t, got)
+
+	got, err = entryValueAs[any](e)
+	require.NoError(t, err)
+	assert.Nil(t, got)
+}
+
 func TestMapNoRows(t *testing.T) {
 	err := mapNoRows(ErrEmptyKey)
 	require.ErrorIs(t, err, ErrEmptyKey)

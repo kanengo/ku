@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"regexp"
 	"sync"
 	"time"
@@ -195,7 +196,9 @@ type entry struct {
 
 	mu              sync.RWMutex
 	raw             string
+	version         uint64
 	refreshInterval time.Duration
+	typed           map[reflect.Type]typedValue
 
 	ready   chan struct{}
 	initErr error
@@ -203,6 +206,11 @@ type entry struct {
 	stopCh   chan struct{}
 	doneCh   chan struct{}
 	stopOnce sync.Once
+}
+
+type typedValue struct {
+	version uint64
+	value   any
 }
 
 func Init(ctx context.Context, dsn string, opts ...Option) error {
@@ -608,7 +616,7 @@ func defaultOrErr() (*Manager, error) {
 }
 
 func getFromManager[T any](ctx context.Context, manager *Manager, key string, options getOptions[T]) (T, error) {
-	raw, err := manager.getRaw(ctx, key, options.forceRefresh)
+	e, err := manager.getEntry(ctx, key, options.forceRefresh)
 	if err != nil {
 		if options.hasDefault && (errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotInitialized)) {
 			return options.defaultValue, nil
@@ -617,7 +625,7 @@ func getFromManager[T any](ctx context.Context, manager *Manager, key string, op
 		return zero, err
 	}
 
-	v, err := decodeRaw[T](raw)
+	v, err := entryValueAs[T](e)
 	if err != nil {
 		var zero T
 		return zero, err
@@ -633,12 +641,12 @@ func decodeRaw[T any](raw string) (T, error) {
 	return v, nil
 }
 
-func (m *Manager) getRaw(ctx context.Context, key string, forceRefresh bool) (string, error) {
+func (m *Manager) getEntry(ctx context.Context, key string, forceRefresh bool) (*entry, error) {
 	if err := m.checkUsable(); err != nil {
-		return "", err
+		return nil, err
 	}
 	if key == "" {
-		return "", ErrEmptyKey
+		return nil, ErrEmptyKey
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -646,17 +654,17 @@ func (m *Manager) getRaw(ctx context.Context, key string, forceRefresh bool) (st
 
 	e, err := m.entryForKey(ctx, key)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if forceRefresh {
 		if err := m.refreshEntry(ctx, e); err != nil {
 			if errors.Is(err, ErrNotFound) {
 				m.stopCachedEntry(key)
 			}
-			return "", err
+			return nil, err
 		}
 	}
-	return e.value(), nil
+	return e, nil
 }
 
 func (m *Manager) entryForKey(ctx context.Context, key string) (*entry, error) {
@@ -703,6 +711,7 @@ func newEntry(key string, refreshInterval time.Duration) *entry {
 	return &entry{
 		key:             key,
 		refreshInterval: refreshInterval,
+		typed:           make(map[reflect.Type]typedValue),
 		ready:           make(chan struct{}),
 		stopCh:          make(chan struct{}),
 		doneCh:          make(chan struct{}),
@@ -713,6 +722,46 @@ func (e *entry) value() string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.raw
+}
+
+func entryValueAs[T any](e *entry) (T, error) {
+	typ := typeOf[T]()
+
+	for {
+		e.mu.RLock()
+		if cached, ok := e.typed[typ]; ok && cached.version == e.version {
+			if cached.value == nil {
+				var zero T
+				e.mu.RUnlock()
+				return zero, nil
+			}
+			v := cached.value.(T)
+			e.mu.RUnlock()
+			return v, nil
+		}
+		raw := e.raw
+		version := e.version
+		e.mu.RUnlock()
+
+		v, err := decodeRaw[T](raw)
+		if err != nil {
+			return v, err
+		}
+
+		e.mu.Lock()
+		if e.version == version {
+			if e.typed == nil {
+				e.typed = make(map[reflect.Type]typedValue)
+			}
+			e.typed[typ] = typedValue{
+				version: version,
+				value:   v,
+			}
+			e.mu.Unlock()
+			return v, nil
+		}
+		e.mu.Unlock()
+	}
 }
 
 func (e *entry) interval() time.Duration {
@@ -729,6 +778,10 @@ func (e *entry) update(record ConfigRecord, defaultRefreshInterval time.Duration
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.raw != record.Value {
+		e.version++
+		e.typed = make(map[reflect.Type]typedValue)
+	}
 	e.raw = record.Value
 	e.refreshInterval = interval
 }
@@ -981,6 +1034,10 @@ func validIdentifier(s string) bool {
 
 func validStatus(status int) bool {
 	return status == StatusDisabled || status == StatusEnabled
+}
+
+func typeOf[T any]() reflect.Type {
+	return reflect.TypeOf((*T)(nil)).Elem()
 }
 
 func joinSQL(parts []string, sep string) string {

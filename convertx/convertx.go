@@ -10,11 +10,11 @@ import (
 )
 
 type Integer interface {
-	int32 | int64 | int | int16 | byte
+	~int32 | ~int64 | ~int | ~int16 | ~byte
 }
 
 type UInteger interface {
-	uint32 | uint64 | uint16 | uint8 | uint
+	~uint32 | ~uint64 | ~uint16 | ~uint8 | ~uint
 }
 
 func String2Integer[T Integer](s string) T {

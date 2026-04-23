@@ -17,3 +17,14 @@ func Map[S any, D any](ss []S, f func(S, int) D) []D {
 	}
 	return ret
 }
+
+func MapFilter[S any, D any](ss []S, f func(S, int) (D, bool)) []D {
+	ret := make([]D, 0, len(ss))
+	for k, v := range ss {
+		d, ok := f(v, k)
+		if ok {
+			ret = append(ret, d)
+		}
+	}
+	return ret
+}

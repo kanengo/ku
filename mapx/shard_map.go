@@ -123,8 +123,13 @@ func (m *ShardMap[TK, TV]) Keys() []TK {
 	return keys
 }
 
-func (m *ShardMap[TK, TV]) Values() []TV {
-	values := make([]TV, 0, m.Len())
+func (m *ShardMap[TK, TV]) Values(allocated ...[]TV) []TV {
+	var values []TV
+	if len(allocated) > 0 {
+		values = allocated[0]
+	} else {
+		values = make([]TV, m.Len())
+	}
 	for i := range m.shards {
 		shard := &m.shards[i]
 		shard.mu.RLock()
